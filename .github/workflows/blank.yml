@@ -1,0 +1,155 @@
+# .github/workflows/pikpak_to_hf.yml
+
+name: PikPak → HuggingFace Transfer
+
+on:
+  workflow_dispatch:
+    inputs:
+      email:
+        description: "PikPak Email"
+        required: true
+      password:
+        description: "PikPak Password"
+        required: true
+        type: string
+      hf_token:
+        description: "HuggingFace Token"
+        required: true
+        type: string
+      repo_id:
+        description: "HuggingFace Repo ID (e.g. username/reponame)"
+        required: true
+      repo_type:
+        description: "HuggingFace Repo Type"
+        required: true
+        type: choice
+        options:
+          - model
+          - dataset
+          - space
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: ⚙️ Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install dependencies
+        run: |
+          pip install pikpakapi huggingface_hub
+          sudo apt-get install -y aria2
+
+      - name: 📁 Create download directory
+        run: mkdir -p /tmp/pikpak/
+
+      - name: ⬇️ Download from PikPak
+        env:
+          PIKPAK_EMAIL: ${{ github.event.inputs.email }}
+          PIKPAK_PASSWORD: ${{ github.event.inputs.password }}
+        run: |
+          cat << 'EOF' > /tmp/pikpak_download.py
+          import os
+          import asyncio
+          from pikpakapi import PikPakApi
+
+          EMAIL    = os.environ["PIKPAK_EMAIL"]
+          PASSWORD = os.environ["PIKPAK_PASSWORD"]
+          SAVE_DIR = "/tmp/pikpak/"
+
+          async def download_all_files():
+              client = PikPakApi(username=EMAIL, password=PASSWORD)
+              await client.login()
+              print("✅ Logged in!")
+
+              async def process_folder(folder_id, folder_path):
+                  result = await client.file_list(parent_id=folder_id)
+                  items = result["files"]
+
+                  if not items:
+                      print(f"📭 Empty: {folder_path or 'root'}")
+                      return
+
+                  for item in items:
+                      name    = item["name"]
+                      kind    = item["kind"]
+                      item_id = item["id"]
+                      save_path = os.path.join(SAVE_DIR, folder_path)
+                      os.makedirs(save_path, exist_ok=True)
+
+                      if kind.endswith("folder"):
+                          new_path = os.path.join(folder_path, name)
+                          print(f"\n📁 Folder: {new_path}")
+                          await process_folder(item_id, new_path)
+                      else:
+                          print(f"\n📄 Downloading: {name}")
+                          try:
+                              res = await client.get_download_url(item_id)
+                              url = res["web_content_link"]
+                              cmd = (
+                                  f'aria2c'
+                                  f' --dir="{save_path}"'
+                                  f' --out="{name}"'
+                                  f' --max-connection-per-server=16'
+                                  f' --split=16'
+                                  f' --min-split-size=1M'
+                                  f' --file-allocation=none'
+                                  f' --user-agent="Mozilla/5.0"'
+                                  f' --header="Referer: https://mypikpak.com"'
+                                  f' --console-log-level=notice'
+                                  f' --summary-interval=1'
+                                  f' "{url}"'
+                              )
+                              os.system(cmd)
+                              print(f"✅ Done: {name}")
+                          except Exception as e:
+                              print(f"❌ Failed: {name} — {e}")
+
+              await process_folder(None, "")
+
+          asyncio.run(download_all_files())
+          EOF
+          python /tmp/pikpak_download.py
+
+      - name: 📋 List downloaded files
+        run: find /tmp/pikpak/ -type f -exec ls -lh {} \;
+
+      - name: 🚀 Upload to HuggingFace
+        env:
+          HF_TOKEN: ${{ github.event.inputs.hf_token }}
+          REPO_ID: ${{ github.event.inputs.repo_id }}
+          REPO_TYPE: ${{ github.event.inputs.repo_type }}
+        run: |
+          cat << 'EOF' > /tmp/hf_upload.py
+          import os
+          from huggingface_hub import HfApi
+
+          TOKEN     = os.environ["HF_TOKEN"]
+          REPO_ID   = os.environ["REPO_ID"]
+          REPO_TYPE = os.environ["REPO_TYPE"]
+
+          api = HfApi()
+
+          # Auto-create repo if it doesn't exist
+          try:
+              api.create_repo(repo_id=REPO_ID, repo_type=REPO_TYPE, token=TOKEN, exist_ok=True)
+              print(f"✅ Repo ready: {REPO_ID}")
+          except Exception as e:
+              print(f"⚠️ Repo check: {e}")
+
+          print(f"🚀 Uploading to https://huggingface.co/{REPO_ID}")
+          api.upload_folder(
+              folder_path="/tmp/pikpak/",
+              repo_id=REPO_ID,
+              repo_type=REPO_TYPE,
+              token=TOKEN
+          )
+          print("✅ Upload complete!")
+          EOF
+          python /tmp/hf_upload.py
