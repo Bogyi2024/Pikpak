@@ -1,0 +1,259 @@
+# .github/workflows/mod.yml
+
+name: PikPak → HuggingFace Transfer
+
+on:
+  workflow_dispatch:
+    inputs:
+      email:
+        description: "PikPak Email"
+        required: true
+      password:
+        description: "PikPak Password"
+        required: true
+        type: string
+      hf_token:
+        description: "HuggingFace Token"
+        required: true
+        type: string
+      repo_id:
+        description: "HuggingFace Repo ID (e.g. username/reponame)"
+        required: true
+      repo_type:
+        description: "HuggingFace Repo Type"
+        required: true
+        type: choice
+        options:
+          - model
+          - dataset
+          - space
+      delete_after_collect:
+        description: "Delete files from PikPak after collecting links? (frees quota)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: ⚙️ Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install dependencies
+        run: |
+          pip install pikpakapi huggingface_hub
+          sudo apt-get install -y aria2
+
+      - name: 📁 Create directories
+        run: |
+          mkdir -p /tmp/pikpak/
+          mkdir -p /tmp/meta/
+
+      # ── Phase 1: Crawl entire PikPak drive.
+      #             Resolve every download URL and save to manifest.
+      #             Optionally delete each file immediately after grabbing its URL
+      #             — the CDN link stays alive so we can still download later.
+      - name: 🔍 Collect all download links (+ optional delete)
+        env:
+          PIKPAK_EMAIL: ${{ github.event.inputs.email }}
+          PIKPAK_PASSWORD: ${{ github.event.inputs.password }}
+          DELETE_AFTER_COLLECT: ${{ github.event.inputs.delete_after_collect }}
+        run: |
+          cat << 'EOF' > /tmp/collect_links.py
+          import os
+          import json
+          import asyncio
+          from pikpakapi import PikPakApi
+
+          EMAIL    = os.environ["PIKPAK_EMAIL"]
+          PASSWORD = os.environ["PIKPAK_PASSWORD"]
+          DO_DELETE = os.environ.get("DELETE_AFTER_COLLECT", "true").lower() == "true"
+          MANIFEST = "/tmp/meta/manifest.json"
+
+          async def collect_all():
+              client = PikPakApi(username=EMAIL, password=PASSWORD)
+              await client.login()
+              print("✅ Logged in — crawling file tree...")
+              if DO_DELETE:
+                  print("🗑️  Delete-after-collect is ENABLED (quota will be freed)\n")
+              else:
+                  print("ℹ️  Delete-after-collect is DISABLED\n")
+
+              entries = []   # {"save_path", "name", "url"}
+
+              async def crawl(folder_id, folder_path):
+                  result = await client.file_list(parent_id=folder_id)
+                  items  = result["files"]
+
+                  if not items:
+                      print(f"📭 Empty folder: {folder_path or 'root'}")
+                      return
+
+                  for item in items:
+                      name    = item["name"]
+                      kind    = item["kind"]
+                      item_id = item["id"]
+
+                      if kind.endswith("folder"):
+                          new_path = os.path.join(folder_path, name)
+                          print(f"📁 Entering: {new_path}")
+                          await crawl(item_id, new_path)
+
+                          # After all children are processed, trash the now-empty folder
+                          if DO_DELETE:
+                              try:
+                                  await client.delete_to_trash([item_id])
+                                  print(f"🗑️  Trashed folder: {new_path}")
+                              except Exception as e:
+                                  print(f"⚠️  Could not trash folder {new_path}: {e}")
+                      else:
+                          save_path = os.path.join("/tmp/pikpak/", folder_path)
+                          try:
+                              res = await client.get_download_url(item_id)
+                              url = res["web_content_link"]
+                              entries.append({
+                                  "save_path": save_path,
+                                  "name":      name,
+                                  "url":       url,
+                              })
+                              print(f"🔗 [{len(entries):>3}] Collected: {os.path.join(folder_path, name)}")
+
+                              # Delete from PikPak now that URL is safely recorded
+                              if DO_DELETE:
+                                  try:
+                                      await client.delete_to_trash([item_id])
+                                      print(f"🗑️  Trashed: {name}")
+                                  except Exception as e:
+                                      print(f"⚠️  Could not trash {name}: {e}")
+
+                          except Exception as e:
+                              print(f"❌ Could not get URL for {name} — {e}")
+
+              await crawl(None, "")
+
+              with open(MANIFEST, "w") as f:
+                  json.dump(entries, f, indent=2)
+
+              print(f"\n✅ Manifest saved — {len(entries)} file(s) queued for download.")
+
+          asyncio.run(collect_all())
+          EOF
+          python /tmp/collect_links.py
+
+      - name: 📋 Show manifest
+        run: |
+          python - << 'EOF'
+          import json, os
+          with open("/tmp/meta/manifest.json") as f:
+              entries = json.load(f)
+          print(f"{'#':>4}  {'Path'}")
+          print("-" * 60)
+          for i, e in enumerate(entries, 1):
+              rel = os.path.relpath(os.path.join(e["save_path"], e["name"]), "/tmp/pikpak/")
+              print(f"{i:>4}  {rel}")
+          print(f"\nTotal: {len(entries)} file(s) queued.")
+          EOF
+
+      # ── Phase 2: Download using the pre-collected CDN URLs.
+      #             No PikPak API calls — files may already be deleted from PikPak,
+      #             but the CDN links remain valid until they expire.
+      - name: ⬇️ Download files sequentially
+        run: |
+          cat << 'EOF' > /tmp/download_files.py
+          import os
+          import json
+
+          MANIFEST = "/tmp/meta/manifest.json"
+
+          with open(MANIFEST) as f:
+              entries = json.load(f)
+
+          total   = len(entries)
+          success = 0
+          failed  = []
+
+          for idx, entry in enumerate(entries, 1):
+              save_path = entry["save_path"]
+              name      = entry["name"]
+              url       = entry["url"]
+
+              os.makedirs(save_path, exist_ok=True)
+              print(f"\n[{idx}/{total}] {name}")
+
+              cmd = (
+                  f'aria2c'
+                  f' --dir="{save_path}"'
+                  f' --out="{name}"'
+                  f' --max-connection-per-server=16'
+                  f' --split=16'
+                  f' --min-split-size=1M'
+                  f' --file-allocation=none'
+                  f' --user-agent="Mozilla/5.0"'
+                  f' --header="Referer: https://mypikpak.com"'
+                  f' --console-log-level=notice'
+                  f' --summary-interval=5'
+                  f' "{url}"'
+              )
+
+              ret = os.system(cmd)
+              if ret == 0:
+                  success += 1
+                  print(f"✅ Done: {name}")
+              else:
+                  failed.append(name)
+                  print(f"❌ Failed: {name} (exit {ret})")
+
+          print(f"\n{'='*50}")
+          print(f"✅ Success : {success}/{total}")
+          if failed:
+              print(f"❌ Failed  : {len(failed)}")
+              for name in failed:
+                  print(f"   • {name}")
+          EOF
+          python /tmp/download_files.py
+
+      - name: 📋 List downloaded files
+        run: find /tmp/pikpak/ -type f -exec ls -lh {} \;
+
+      - name: 🚀 Upload to HuggingFace
+        env:
+          HF_TOKEN: ${{ github.event.inputs.hf_token }}
+          REPO_ID: ${{ github.event.inputs.repo_id }}
+          REPO_TYPE: ${{ github.event.inputs.repo_type }}
+        run: |
+          cat << 'EOF' > /tmp/hf_upload.py
+          import os
+          from huggingface_hub import HfApi
+
+          TOKEN     = os.environ["HF_TOKEN"]
+          REPO_ID   = os.environ["REPO_ID"]
+          REPO_TYPE = os.environ["REPO_TYPE"]
+
+          api = HfApi()
+
+          try:
+              api.create_repo(repo_id=REPO_ID, repo_type=REPO_TYPE, token=TOKEN, exist_ok=True)
+              print(f"✅ Repo ready: {REPO_ID}")
+          except Exception as e:
+              print(f"⚠️ Repo check: {e}")
+
+          print(f"🚀 Uploading to https://huggingface.co/{REPO_ID}")
+          api.upload_folder(
+              folder_path="/tmp/pikpak/",
+              repo_id=REPO_ID,
+              repo_type=REPO_TYPE,
+              token=TOKEN
+          )
+          print("✅ Upload complete!")
+          EOF
+          python /tmp/hf_upload.py
