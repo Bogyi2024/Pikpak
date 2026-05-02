@@ -1,6 +1,6 @@
 # .github/workflows/mod.yml
 
-name: PikPak → HuggingFace Transfer
+name: PikPak → HuggingFace Transfer Mod
 
 on:
   workflow_dispatch:
