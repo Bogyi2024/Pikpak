@@ -5,6 +5,7 @@ name: PikPak / Direct Link → HuggingFace Transfer
 on:
   workflow_dispatch:
     inputs:
+
       # ── Source ───────────────────────────────────────────────────────────────
       source_type:
         description: "Download source"
@@ -15,16 +16,16 @@ on:
           - pikpak
           - direct_links
 
-      # ── PikPak credentials (only needed when source_type = pikpak) ──────────
+      # ── PikPak (ignored when source_type = direct_links) ────────────────────
       email:
-        description: "PikPak Email  [pikpak only]"
+        description: "PikPak Email  ▸ pikpak only"
         required: false
       password:
-        description: "PikPak Password  [pikpak only]"
+        description: "PikPak Password  ▸ pikpak only"
         required: false
         type: string
       delete_after_collect:
-        description: "Delete files from PikPak after collecting links?  [pikpak only]"
+        description: "Delete files from PikPak after collecting links?  ▸ pikpak only"
         required: false
         default: "true"
         type: choice
@@ -32,30 +33,30 @@ on:
           - "true"
           - "false"
 
-      # ── Direct links (only needed when source_type = direct_links) ──────────
+      # ── Direct links (ignored when source_type = pikpak) ────────────────────
       direct_links:
         description: |
-          Direct download URLs  [direct_links only]
-          One URL per line. Optionally add a filename:
-            https://example.com/file.bin
-            https://example.com/archive.tar.gz  my-archive.tar.gz
+          Direct download URLs  ▸ direct_links only
+          • Multiple URLs supported — one per line
+          • Optional custom filename / subpath after the URL:
+              https://example.com/model.bin
+              https://example.com/weights.pt   my-weights.pt
+              https://example.com/data.zip     subdir/data.zip
         required: false
 
       # ── Downloader ───────────────────────────────────────────────────────────
       downloader:
-        description: >
-          Downloader to use.
-          Defaults: aria2c for PikPak (parallel connections), wget for direct links (simple & reliable).
+        description: "Downloader  (auto → aria2c for pikpak, wget for direct_links)"
         required: true
         default: "auto"
         type: choice
         options:
-          - auto        # aria2c for pikpak, wget for direct_links
+          - auto
           - aria2c
           - wget
           - curl
 
-      # ── HuggingFace destination ───────────────────────────────────────────────
+      # ── HuggingFace ──────────────────────────────────────────────────────────
       hf_token:
         description: "HuggingFace Token"
         required: true
@@ -80,6 +81,46 @@ jobs:
       - name: ⚙️ Checkout repo
         uses: actions/checkout@v4
 
+      # ── Early validation: catch missing required fields per source_type ──────
+      - name: ✅ Validate inputs
+        env:
+          SOURCE_TYPE:  ${{ github.event.inputs.source_type }}
+          EMAIL:        ${{ github.event.inputs.email }}
+          PASSWORD:     ${{ github.event.inputs.password }}
+          DIRECT_LINKS: ${{ github.event.inputs.direct_links }}
+        run: |
+          python - << 'EOF'
+          import os, sys
+
+          source = os.environ.get("SOURCE_TYPE", "")
+          errors = []
+
+          if source == "pikpak":
+              if not os.environ.get("EMAIL", "").strip():
+                  errors.append("❌  'email' is required when source_type = pikpak")
+              if not os.environ.get("PASSWORD", "").strip():
+                  errors.append("❌  'password' is required when source_type = pikpak")
+
+          elif source == "direct_links":
+              raw  = os.environ.get("DIRECT_LINKS", "").strip()
+              urls = [l.strip() for l in raw.splitlines()
+                      if l.strip() and not l.strip().startswith("#")]
+              if not urls:
+                  errors.append("❌  'direct_links' must contain at least one URL "
+                                "when source_type = direct_links")
+              else:
+                  print(f"✅  {len(urls)} URL(s) detected in direct_links")
+
+          else:
+              errors.append(f"❌  Unknown source_type: {source!r}")
+
+          if errors:
+              print("\n".join(errors))
+              sys.exit(1)
+
+          print(f"✅  Validation passed  (source: {source})")
+          EOF
+
       - name: 🐍 Set up Python
         uses: actions/setup-python@v5
         with:
@@ -96,13 +137,13 @@ jobs:
           mkdir -p /tmp/meta/
 
       # ═══════════════════════════════════════════════════════════════════════
-      #  PHASE 1-A  ·  PikPak — crawl & collect download URLs
+      #  PHASE 1-A  ·  PikPak — crawl & collect CDN download URLs
       # ═══════════════════════════════════════════════════════════════════════
       - name: 🔍 [PikPak] Collect all download links (+ optional delete)
         if: ${{ github.event.inputs.source_type == 'pikpak' }}
         env:
-          PIKPAK_EMAIL: ${{ github.event.inputs.email }}
-          PIKPAK_PASSWORD: ${{ github.event.inputs.password }}
+          PIKPAK_EMAIL:         ${{ github.event.inputs.email }}
+          PIKPAK_PASSWORD:      ${{ github.event.inputs.password }}
           DELETE_AFTER_COLLECT: ${{ github.event.inputs.delete_after_collect }}
         run: |
           cat << 'EOF' > /tmp/collect_links.py
@@ -118,12 +159,9 @@ jobs:
               client = PikPakApi(username=EMAIL, password=PASSWORD)
               await client.login()
               print("✅ Logged in — crawling file tree...")
-              if DO_DELETE:
-                  print("🗑️  Delete-after-collect is ENABLED (quota will be freed)\n")
-              else:
-                  print("ℹ️  Delete-after-collect is DISABLED\n")
+              print(f"{'🗑️  Delete-after-collect ENABLED' if DO_DELETE else 'ℹ️  Delete-after-collect DISABLED'}\n")
 
-              entries = []   # {save_path, name, url}
+              entries = []
 
               async def crawl(folder_id, folder_path):
                   result = await client.file_list(parent_id=folder_id)
@@ -165,14 +203,14 @@ jobs:
               await crawl(None, "")
               with open(MANIFEST, "w") as f:
                   json.dump(entries, f, indent=2)
-              print(f"\n✅ Manifest saved — {len(entries)} file(s) queued for download.")
+              print(f"\n✅ Manifest saved — {len(entries)} file(s) queued.")
 
           asyncio.run(collect_all())
           EOF
           python /tmp/collect_links.py
 
       # ═══════════════════════════════════════════════════════════════════════
-      #  PHASE 1-B  ·  Direct links — parse user input into manifest
+      #  PHASE 1-B  ·  Direct links — build manifest from user input
       # ═══════════════════════════════════════════════════════════════════════
       - name: 🔗 [Direct] Parse direct download links
         if: ${{ github.event.inputs.source_type == 'direct_links' }}
@@ -194,33 +232,37 @@ jobs:
               if not line or line.startswith("#"):
                   continue
 
-              # Support:  <url>          → filename derived from URL
-              #           <url>  <name>  → explicit filename
+              # Formats accepted:
+              #   <url>                    → filename derived from URL path
+              #   <url>  <name>            → flat custom filename
+              #   <url>  <subdir/name>     → placed in subdirectory on HF
               parts = line.split(None, 1)
               url   = parts[0]
+
               if len(parts) == 2:
-                  name = parts[1].strip()
+                  custom    = parts[1].strip()
+                  name      = os.path.basename(custom)
+                  subdir    = os.path.dirname(custom)
+                  save_path = os.path.join(SAVE_DIR, subdir) if subdir else SAVE_DIR
               else:
-                  # Derive filename from URL path; fall back to index-based name
-                  path_part = urlparse(url).path
-                  name      = os.path.basename(path_part) or f"file_{len(entries)+1}"
+                  parsed    = urlparse(url)
+                  name      = os.path.basename(parsed.path) or f"file_{len(entries)+1}"
+                  save_path = SAVE_DIR
 
-              entries.append({"save_path": SAVE_DIR, "name": name, "url": url})
-              print(f"🔗 [{len(entries):>3}] Queued: {name}  ←  {url}")
-
-          if not entries:
-              print("❌ No valid URLs found in direct_links input.")
-              raise SystemExit(1)
+              entries.append({"save_path": save_path, "name": name, "url": url})
+              display = os.path.relpath(os.path.join(save_path, name), SAVE_DIR)
+              print(f"🔗 [{len(entries):>3}] {display}")
+              print(f"         ← {url[:80]}{'...' if len(url) > 80 else ''}")
 
           with open(MANIFEST, "w") as f:
               json.dump(entries, f, indent=2)
 
-          print(f"\n✅ Manifest saved — {len(entries)} file(s) queued for download.")
+          print(f"\n✅ Manifest saved — {len(entries)} file(s) queued.")
           EOF
           python /tmp/parse_direct.py
 
       # ═══════════════════════════════════════════════════════════════════════
-      #  PHASE 1-C  ·  Show manifest (both source types)
+      #  PHASE 1-C  ·  Show full manifest table
       # ═══════════════════════════════════════════════════════════════════════
       - name: 📋 Show manifest
         run: |
@@ -228,17 +270,17 @@ jobs:
           import json, os
           with open("/tmp/meta/manifest.json") as f:
               entries = json.load(f)
-          print(f"{'#':>4}  {'Filename':<40}  {'URL'}")
-          print("-" * 100)
+          print(f"{'#':>4}  {'HF path':<45}  URL")
+          print("-" * 105)
           for i, e in enumerate(entries, 1):
-              rel = os.path.relpath(os.path.join(e["save_path"], e["name"]), "/tmp/pikpak/")
-              url_preview = e["url"][:60] + "..." if len(e["url"]) > 60 else e["url"]
-              print(f"{i:>4}  {rel:<40}  {url_preview}")
+              rel     = os.path.relpath(os.path.join(e["save_path"], e["name"]), "/tmp/pikpak/")
+              preview = e["url"][:55] + "..." if len(e["url"]) > 55 else e["url"]
+              print(f"{i:>4}  {rel:<45}  {preview}")
           print(f"\nTotal: {len(entries)} file(s) queued.")
           EOF
 
       # ═══════════════════════════════════════════════════════════════════════
-      #  PHASE 2  ·  Download files using the selected downloader
+      #  PHASE 2  ·  Download all files
       # ═══════════════════════════════════════════════════════════════════════
       - name: ⬇️ Download files
         env:
@@ -247,25 +289,23 @@ jobs:
         run: |
           cat << 'EOF' > /tmp/download_files.py
           import os, json, subprocess, shutil, sys
-          from urllib.parse import urlparse
 
           MANIFEST    = "/tmp/meta/manifest.json"
           SOURCE_TYPE = os.environ.get("SOURCE_TYPE", "pikpak")
           DL_CHOICE   = os.environ.get("DOWNLOADER", "auto").lower()
 
-          # ── Resolve "auto" to a sensible default ──────────────────────────
+          # ── Resolve "auto" ────────────────────────────────────────────────
           if DL_CHOICE == "auto":
               DL_CHOICE = "aria2c" if SOURCE_TYPE == "pikpak" else "wget"
-              print(f"ℹ️  Downloader set to '{DL_CHOICE}' (auto-selected for source '{SOURCE_TYPE}')")
+              print(f"ℹ️  Auto-selected downloader: {DL_CHOICE!r}  (source: {SOURCE_TYPE})")
 
-          # ── Verify the binary exists ──────────────────────────────────────
           if not shutil.which(DL_CHOICE):
               print(f"❌ Downloader '{DL_CHOICE}' not found in PATH.")
               sys.exit(1)
 
-          print(f"🔧 Using downloader: {DL_CHOICE}\n")
+          print(f"🔧 Downloader: {DL_CHOICE}\n")
 
-          # ── Per-downloader command builders ───────────────────────────────
+          # ── Command builders ──────────────────────────────────────────────
           def cmd_aria2c(url, save_path, name):
               return [
                   "aria2c",
@@ -275,7 +315,7 @@ jobs:
                   "--split=16",
                   "--min-split-size=1M",
                   "--file-allocation=none",
-                  '--user-agent=Mozilla/5.0',
+                  "--user-agent=Mozilla/5.0",
                   "--header=Referer: https://mypikpak.com",
                   "--console-log-level=notice",
                   "--summary-interval=5",
@@ -295,23 +335,17 @@ jobs:
 
           def cmd_curl(url, save_path, name):
               return [
-                  "curl",
-                  "-L",                          # follow redirects
+                  "curl", "-L",
                   "--progress-bar",
                   "-A", "Mozilla/5.0",
                   "-o", os.path.join(save_path, name),
                   url,
               ]
 
-          BUILDERS = {
-              "aria2c": cmd_aria2c,
-              "wget":   cmd_wget,
-              "curl":   cmd_curl,
-          }
-
+          BUILDERS = {"aria2c": cmd_aria2c, "wget": cmd_wget, "curl": cmd_curl}
           build_cmd = BUILDERS.get(DL_CHOICE)
-          if build_cmd is None:
-              print(f"❌ Unknown downloader: {DL_CHOICE}. Choose aria2c, wget, or curl.")
+          if not build_cmd:
+              print(f"❌ Unknown downloader: {DL_CHOICE!r}.  Choose: aria2c, wget, curl")
               sys.exit(1)
 
           # ── Download loop ─────────────────────────────────────────────────
@@ -321,16 +355,13 @@ jobs:
           total, success, failed = len(entries), 0, []
 
           for idx, entry in enumerate(entries, 1):
-              save_path = entry["save_path"]
-              name      = entry["name"]
-              url       = entry["url"]
-
+              save_path, name, url = entry["save_path"], entry["name"], entry["url"]
               os.makedirs(save_path, exist_ok=True)
+
               print(f"\n[{idx}/{total}] ⬇️  {name}")
               print(f"         🔗 {url[:80]}{'...' if len(url) > 80 else ''}")
 
-              cmd = build_cmd(url, save_path, name)
-              ret = subprocess.run(cmd).returncode
+              ret = subprocess.run(build_cmd(url, save_path, name)).returncode
 
               if ret == 0:
                   dest = os.path.join(save_path, name)
@@ -341,7 +372,6 @@ jobs:
                   print(f"❌ Failed: {name}  (exit {ret})")
                   failed.append(name)
 
-          # ── Summary ───────────────────────────────────────────────────────
           print(f"\n{'='*55}")
           print(f"Downloader : {DL_CHOICE}")
           print(f"✅ Success  : {success}/{total}")
@@ -349,7 +379,6 @@ jobs:
               print(f"❌ Failed   : {len(failed)}")
               for n in failed:
                   print(f"   • {n}")
-          if failed:
               sys.exit(1)
           EOF
           python /tmp/download_files.py
