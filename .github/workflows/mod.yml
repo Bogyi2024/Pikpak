@@ -1,0 +1,524 @@
+name: PikPak / Direct Link → HuggingFace Transfer
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      # Source
+      source_type:
+        description: "Download source"
+        required: true
+        default: "pikpak"
+        type: choice
+        options:
+          - pikpak
+          - direct_links
+
+      # PikPak (ignored when source_type = direct_links)
+      email:
+        description: "PikPak Email  ▸ pikpak only"
+        required: false
+      password:
+        description: "PikPak Password  ▸ pikpak only"
+        required: false
+        type: string
+      pikpak_token:
+        description: "PikPak Token (alternative to email/password) - pikpak only"
+        required: false
+        type: string
+      delete_after_collect:
+        description: "Delete files from PikPak after collecting links?  ▸ pikpak only"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+      # Direct links (ignored when source_type = pikpak)
+      direct_links:
+        description: |
+          Direct download URLs  ▸ direct_links only
+          • Multiple URLs supported — one per line
+          • Optional custom filename / subpath after the URL:
+              https://example.com/model.bin
+              https://example.com/weights.pt   my-weights.pt
+              https://example.com/data.zip     subdir/data.zip
+        required: false
+
+      # Downloader
+      downloader:
+        description: "Downloader  (auto → aria2c for pikpak, wget for direct_links)"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - aria2c
+          - wget
+          - curl
+
+      # HuggingFace
+      hf_token:
+        description: "HuggingFace Token"
+        required: true
+        type: string
+      repo_id:
+        description: "HuggingFace Repo ID (e.g. username/reponame)"
+        required: true
+      repo_type:
+        description: "HuggingFace Repo Type"
+        required: true
+        type: choice
+        options:
+          - model
+          - dataset
+          - space
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Read from the event file so values are not exposed in this step's env.
+      # Register masks BEFORE any later step maps inputs into environment variables.
+      # This protects subsequent log output, not previously published logs.
+      - name: Mask sensitive inputs
+        shell: bash
+        run: |
+          python - << 'EOF'
+          import json, os
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
+              inputs = json.load(f).get("inputs", {})
+
+          for key in ("email", "password", "pikpak_token", "hf_token", "direct_links"):
+              value = inputs.get(key, "")
+              if not value:
+                  continue
+              value = str(value)
+              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::add-mask::{escaped}", flush=True)
+          EOF
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
+        env:
+          SOURCE_TYPE:  ${{ github.event.inputs.source_type }}
+          EMAIL:        ${{ github.event.inputs.email }}
+          PASSWORD:     ${{ github.event.inputs.password }}
+          PIKPAK_TOKEN: ${{ github.event.inputs.pikpak_token }}
+          DIRECT_LINKS: ${{ github.event.inputs.direct_links }}
+        run: |
+          python - << 'EOF'
+          import os, sys
+
+          source = os.environ.get("SOURCE_TYPE", "")
+          errors = []
+
+          if source == "pikpak":
+              if not os.environ.get("PIKPAK_TOKEN", "").strip():
+                  if not os.environ.get("EMAIL", "").strip():
+                      errors.append("'email' is required when source_type = pikpak")
+                  if not os.environ.get("PASSWORD", "").strip():
+                      errors.append("'password' is required when source_type = pikpak")
+          elif source == "direct_links":
+              raw = os.environ.get("DIRECT_LINKS", "").strip()
+              urls = [line.strip() for line in raw.splitlines()
+                      if line.strip() and not line.strip().startswith("#")]
+              if not urls:
+                  errors.append("'direct_links' must contain at least one URL "
+                                "when source_type = direct_links")
+              else:
+                  print(f"{len(urls)} URL(s) detected in direct_links")
+          else:
+              errors.append(f"Unknown source_type: {source!r}")
+
+          if errors:
+              print("\n".join(errors))
+              sys.exit(1)
+
+          print(f"Validation passed (source: {source})")
+          EOF
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install "pikpakapi==0.1.11" huggingface_hub cryptography
+          sudo apt-get install -y aria2 wget curl
+
+      - name: Create directories
+        run: |
+          mkdir -p /tmp/pikpak/
+          mkdir -p /tmp/meta/
+
+      # PHASE 1-A: PikPak - collect download links.
+      # Existing delete-after-collect behavior is preserved: when true,
+      # files/folders are moved to trash BEFORE downloading or uploading.
+      - name: "[PikPak] Collect all download links (+ optional delete)"
+        if: ${{ github.event.inputs.source_type == 'pikpak' }}
+        env:
+          PIKPAK_EMAIL:         ${{ github.event.inputs.email }}
+          PIKPAK_PASSWORD:      ${{ github.event.inputs.password }}
+          PIKPAK_TOKEN:         ${{ github.event.inputs.pikpak_token }}
+          PIKPAK_TOKEN_SECRET:  ${{ secrets.PIKPAK_TOKEN_SECRET }}
+          DELETE_AFTER_COLLECT: ${{ github.event.inputs.delete_after_collect }}
+        run: |
+          cat << 'EOF' > /tmp/collect_links.py
+          import os, json, asyncio, hashlib
+          from pikpakapi import PikPakApi
+          from pikpakapi.PikpakException import PikpakException
+
+          class PikPakLoginFix(PikPakApi):
+              async def _request_post(self, url, data=None, headers=None):
+                  if url.endswith("/v1/auth/signin"):
+                      # pikpakapi 0.1.11 sends JSON but declares form encoding.
+                      # Match the body and restore normal client/device headers.
+                      headers = self.get_headers()
+                  return await super()._request_post(
+                      url, data=data, headers=headers
+                  )
+
+          import base64, time
+
+          def resolve_credentials():
+              token = os.environ.get("PIKPAK_TOKEN", "").strip()
+              if not token:
+                  return os.environ["PIKPAK_EMAIL"], os.environ["PIKPAK_PASSWORD"]
+              from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+              secret = os.environ.get("PIKPAK_TOKEN_SECRET", "")
+              if not secret:
+                  raise SystemExit("PIKPAK_TOKEN_SECRET repo secret is missing.")
+              if not token.startswith("pkt1."):
+                  raise SystemExit("Unsupported token format.")
+              raw = base64.urlsafe_b64decode(token[5:] + "=" * (-len(token[5:]) % 4))
+              key = hashlib.pbkdf2_hmac("sha256", secret.encode(), raw[:16], 100000, 32)
+              try:
+                  p = json.loads(AESGCM(key).decrypt(raw[16:28], raw[28:], None))
+              except Exception:
+                  raise SystemExit("Token could not be decrypted (wrong secret or corrupted token).") from None
+              if p["exp"] < time.time():
+                  raise SystemExit("Token expired. Generate a new one.")
+              for v in (p["u"], p["p"], p["ip"]):
+                  print("::add-mask::" + v.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"), flush=True)
+              print("Token OK")
+              return p["u"], p["p"]
+
+          EMAIL, PASSWORD = resolve_credentials()
+          DO_DELETE = os.environ.get("DELETE_AFTER_COLLECT", "true").lower() == "true"
+          MANIFEST = "/tmp/meta/manifest.json"
+          MAX_COMPONENT_BYTES = 200
+
+          def safe_name(name: str) -> str:
+              """Shorten long UTF-8 names while retaining extensions and a hash."""
+              name = (name or "").strip().replace("/", "_").replace("\\", "_") or "file"
+              raw = name.encode("utf-8")
+              if len(raw) <= MAX_COMPONENT_BYTES:
+                  return name
+              base, ext = os.path.splitext(name)
+              if len(ext.encode("utf-8")) > 30:
+                  base, ext = name, ""
+              digest = hashlib.sha1(raw).hexdigest()[:8]
+              budget = MAX_COMPONENT_BYTES - len(ext.encode("utf-8")) - len(digest) - 1
+              base = base.encode("utf-8")[:budget].decode("utf-8", "ignore")
+              return f"{base}_{digest}{ext}"
+
+          async def collect_all():
+              client = PikPakLoginFix(username=EMAIL, password=PASSWORD)
+              try:
+                  await client.login()
+              except PikpakException as exc:
+                  await client.httpx_client.aclose()
+                  if "review" in str(exc).lower():
+                      raise SystemExit(
+                          "PikPak rejected login with a review response. "
+                          "The JSON/header patch did not resolve this rejection. "
+                          "Sign in through the official PikPak app or website, "
+                          "complete any requested verification, and contact "
+                          "PikPak support if the rejection persists. "
+                          "No files were collected or deleted in this attempt."
+                      ) from None
+                  raise
+
+              print("Logged in - crawling file tree...")
+              print(f"Delete-after-collect {'ENABLED' if DO_DELETE else 'DISABLED'}\n")
+              entries = []
+
+              async def crawl(folder_id, folder_path):
+                  result = await client.file_list(parent_id=folder_id)
+                  items = result["files"]
+
+                  if not items:
+                      print(f"Empty folder: {folder_path or 'root'}")
+                      return
+
+                  for item in items:
+                      name, kind, item_id = item["name"], item["kind"], item["id"]
+                      if kind.endswith("folder"):
+                          new_path = os.path.join(folder_path, safe_name(name))
+                          print(f"Entering: {new_path}")
+                          await crawl(item_id, new_path)
+                          if DO_DELETE:
+                              try:
+                                  await client.delete_to_trash([item_id])
+                                  print(f"Trashed folder: {new_path}")
+                              except Exception as e:
+                                  print(f"Could not trash folder {new_path}: {e}")
+                      else:
+                          save_path = os.path.join("/tmp/pikpak/", folder_path)
+                          try:
+                              res = await client.get_download_url(item_id)
+                              url = res["web_content_link"]
+                              fname = safe_name(name)
+                              entries.append({"save_path": save_path, "name": fname, "url": url})
+                              print(f"[{len(entries):>3}] Collected: {os.path.join(folder_path, fname)}")
+                              if fname != name:
+                                  print(f"Truncated from {len(name.encode('utf-8'))}-byte original name")
+                              if DO_DELETE:
+                                  try:
+                                      await client.delete_to_trash([item_id])
+                                      print(f"Trashed: {name}")
+                                  except Exception as e:
+                                      print(f"Could not trash {name}: {e}")
+                          except Exception as e:
+                              print(f"Could not get URL for {name} - {e}")
+
+              try:
+                  await crawl(None, "")
+                  with open(MANIFEST, "w") as f:
+                      json.dump(entries, f, indent=2)
+                  print(f"\nManifest saved - {len(entries)} file(s) queued.")
+              finally:
+                  await client.httpx_client.aclose()
+
+          asyncio.run(collect_all())
+          EOF
+          python /tmp/collect_links.py
+
+      # PHASE 1-B: Direct links - build manifest from existing input.
+      - name: "[Direct] Parse direct download links"
+        if: ${{ github.event.inputs.source_type == 'direct_links' }}
+        env:
+          DIRECT_LINKS: ${{ github.event.inputs.direct_links }}
+        run: |
+          cat << 'EOF' > /tmp/parse_direct.py
+          import os, json, hashlib
+          from urllib.parse import urlparse, unquote
+
+          RAW = os.environ.get("DIRECT_LINKS", "")
+          MANIFEST = "/tmp/meta/manifest.json"
+          SAVE_DIR = "/tmp/pikpak/"
+          MAX_COMPONENT_BYTES = 200
+
+          def safe_name(name: str) -> str:
+              name = (name or "").strip().replace("/", "_").replace("\\", "_") or "file"
+              raw = name.encode("utf-8")
+              if len(raw) <= MAX_COMPONENT_BYTES:
+                  return name
+              base, ext = os.path.splitext(name)
+              if len(ext.encode("utf-8")) > 30:
+                  base, ext = name, ""
+              digest = hashlib.sha1(raw).hexdigest()[:8]
+              budget = MAX_COMPONENT_BYTES - len(ext.encode("utf-8")) - len(digest) - 1
+              base = base.encode("utf-8")[:budget].decode("utf-8", "ignore")
+              return f"{base}_{digest}{ext}"
+
+          entries = []
+          for raw_line in RAW.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+
+              parts = line.split(None, 1)
+              url = parts[0]
+              if len(parts) == 2:
+                  custom = parts[1].strip().replace("\\", "/")
+                  name = safe_name(os.path.basename(custom))
+                  subdir = os.path.dirname(custom)
+                  save_path = (os.path.join(SAVE_DIR, *[safe_name(p) for p in subdir.split("/") if p])
+                               if subdir else SAVE_DIR)
+              else:
+                  parsed = urlparse(url)
+                  decoded_path = unquote(parsed.path)
+                  name = safe_name(os.path.basename(decoded_path) or f"file_{len(entries)+1}")
+                  save_path = SAVE_DIR
+
+              entries.append({"save_path": save_path, "name": name, "url": url})
+              display = os.path.relpath(os.path.join(save_path, name), SAVE_DIR)
+              print(f"[{len(entries):>3}] {display}")
+              print(f"Source: {url[:80]}{'...' if len(url) > 80 else ''}")
+
+          with open(MANIFEST, "w") as f:
+              json.dump(entries, f, indent=2)
+          print(f"\nManifest saved - {len(entries)} file(s) queued.")
+          EOF
+          python /tmp/parse_direct.py
+
+      # PHASE 1-C: Show manifest.
+      - name: Show manifest
+        run: |
+          python - << 'EOF'
+          import json, os
+          with open("/tmp/meta/manifest.json") as f:
+              entries = json.load(f)
+          print(f"{'#':>4}  {'HF path':<45}  URL")
+          print("-" * 105)
+          for i, e in enumerate(entries, 1):
+              rel = os.path.relpath(os.path.join(e["save_path"], e["name"]), "/tmp/pikpak/")
+              preview = e["url"][:55] + "..." if len(e["url"]) > 55 else e["url"]
+              print(f"{i:>4}  {rel:<45}  {preview}")
+          print(f"\nTotal: {len(entries)} file(s) queued.")
+          EOF
+
+      # PHASE 2: Download all files.
+      - name: Download files
+        env:
+          SOURCE_TYPE: ${{ github.event.inputs.source_type }}
+          DOWNLOADER:  ${{ github.event.inputs.downloader }}
+        run: |
+          cat << 'EOF' > /tmp/download_files.py
+          import os, json, subprocess, shutil, sys, hashlib
+
+          MANIFEST = "/tmp/meta/manifest.json"
+          SOURCE_TYPE = os.environ.get("SOURCE_TYPE", "pikpak")
+          DL_CHOICE = os.environ.get("DOWNLOADER", "auto").lower()
+          MAX_COMPONENT_BYTES = 200
+
+          def safe_name(name: str) -> str:
+              name = (name or "").strip().replace("/", "_").replace("\\", "_") or "file"
+              raw = name.encode("utf-8")
+              if len(raw) <= MAX_COMPONENT_BYTES:
+                  return name
+              base, ext = os.path.splitext(name)
+              if len(ext.encode("utf-8")) > 30:
+                  base, ext = name, ""
+              digest = hashlib.sha1(raw).hexdigest()[:8]
+              budget = MAX_COMPONENT_BYTES - len(ext.encode("utf-8")) - len(digest) - 1
+              base = base.encode("utf-8")[:budget].decode("utf-8", "ignore")
+              return f"{base}_{digest}{ext}"
+
+          if DL_CHOICE == "auto":
+              DL_CHOICE = "aria2c" if SOURCE_TYPE == "pikpak" else "wget"
+              print(f"Auto-selected downloader: {DL_CHOICE!r} (source: {SOURCE_TYPE})")
+
+          if not shutil.which(DL_CHOICE):
+              print(f"Downloader '{DL_CHOICE}' not found in PATH.")
+              sys.exit(1)
+
+          print(f"Downloader: {DL_CHOICE}\n")
+
+          def cmd_aria2c(url, save_path, name):
+              return [
+                  "aria2c",
+                  f"--dir={save_path}",
+                  f"--out={name}",
+                  "--max-connection-per-server=16",
+                  "--split=16",
+                  "--min-split-size=1M",
+                  "--file-allocation=none",
+                  "--user-agent=Mozilla/5.0",
+                  "--header=Referer: https://mypikpak.com",
+                  "--console-log-level=notice",
+                  "--summary-interval=5",
+                  url,
+              ]
+
+          def cmd_wget(url, save_path, name):
+              return [
+                  "wget",
+                  "--no-verbose",
+                  "--show-progress",
+                  "--progress=bar:force",
+                  "--user-agent=Mozilla/5.0",
+                  "-O", os.path.join(save_path, name),
+                  url,
+              ]
+
+          def cmd_curl(url, save_path, name):
+              return [
+                  "curl", "-L",
+                  "--progress-bar",
+                  "-A", "Mozilla/5.0",
+                  "-o", os.path.join(save_path, name),
+                  url,
+              ]
+
+          BUILDERS = {"aria2c": cmd_aria2c, "wget": cmd_wget, "curl": cmd_curl}
+          build_cmd = BUILDERS.get(DL_CHOICE)
+          if not build_cmd:
+              print(f"Unknown downloader: {DL_CHOICE!r}. Choose: aria2c, wget, curl")
+              sys.exit(1)
+
+          with open(MANIFEST) as f:
+              entries = json.load(f)
+          total, success, failed = len(entries), 0, []
+
+          for idx, entry in enumerate(entries, 1):
+              save_path, name, url = entry["save_path"], entry["name"], entry["url"]
+              name = safe_name(name)
+              os.makedirs(save_path, exist_ok=True)
+              print(f"\n[{idx}/{total}] Downloading: {name}")
+              print(f"Source: {url[:80]}{'...' if len(url) > 80 else ''}")
+              ret = subprocess.run(build_cmd(url, save_path, name)).returncode
+
+              if ret == 0:
+                  dest = os.path.join(save_path, name)
+                  size = os.path.getsize(dest) if os.path.exists(dest) else 0
+                  print(f"Done: {name} ({size / 1024 / 1024:.2f} MB)")
+                  success += 1
+              else:
+                  print(f"Failed: {name} (exit {ret})")
+                  failed.append(name)
+
+          print(f"\n{'='*55}")
+          print(f"Downloader : {DL_CHOICE}")
+          print(f"Success    : {success}/{total}")
+          if failed:
+              print(f"Failed     : {len(failed)}")
+              for name in failed:
+                  print(f"  - {name}")
+              sys.exit(1)
+          EOF
+          python /tmp/download_files.py
+
+      - name: List downloaded files
+        run: find /tmp/pikpak/ -type f -exec ls -lh {} \;
+
+      # PHASE 3: Upload to HuggingFace.
+      - name: Upload to HuggingFace
+        env:
+          HF_TOKEN:  ${{ github.event.inputs.hf_token }}
+          REPO_ID:   ${{ github.event.inputs.repo_id }}
+          REPO_TYPE: ${{ github.event.inputs.repo_type }}
+        run: |
+          cat << 'EOF' > /tmp/hf_upload.py
+          import os
+          from huggingface_hub import HfApi
+
+          TOKEN = os.environ["HF_TOKEN"]
+          REPO_ID = os.environ["REPO_ID"]
+          REPO_TYPE = os.environ["REPO_TYPE"]
+          api = HfApi()
+
+          try:
+              api.create_repo(repo_id=REPO_ID, repo_type=REPO_TYPE, token=TOKEN, exist_ok=True)
+              print(f"Repo ready: {REPO_ID}")
+          except Exception as e:
+              print(f"Repo check: {e}")
+
+          print(f"Uploading to https://huggingface.co/{REPO_ID}")
+          api.upload_folder(
+              folder_path="/tmp/pikpak/",
+              repo_id=REPO_ID,
+              repo_type=REPO_TYPE,
+              token=TOKEN,
+          )
+          print("Upload complete!")
+          EOF
+          python /tmp/hf_upload.py
