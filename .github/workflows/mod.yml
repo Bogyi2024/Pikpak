@@ -22,10 +22,6 @@ on:
         description: "PikPak Password  ▸ pikpak only"
         required: false
         type: string
-      pikpak_token:
-        description: "PikPak Token (alternative to email/password) - pikpak only"
-        required: false
-        type: string
       delete_after_collect:
         description: "Delete files from PikPak after collecting links?  ▸ pikpak only"
         required: false
@@ -92,7 +88,7 @@ jobs:
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
               inputs = json.load(f).get("inputs", {})
 
-          for key in ("email", "password", "pikpak_token", "hf_token", "direct_links"):
+          for key in ("email", "password", "hf_token", "direct_links"):
               value = inputs.get(key, "")
               if not value:
                   continue
@@ -109,7 +105,6 @@ jobs:
           SOURCE_TYPE:  ${{ github.event.inputs.source_type }}
           EMAIL:        ${{ github.event.inputs.email }}
           PASSWORD:     ${{ github.event.inputs.password }}
-          PIKPAK_TOKEN: ${{ github.event.inputs.pikpak_token }}
           DIRECT_LINKS: ${{ github.event.inputs.direct_links }}
         run: |
           python - << 'EOF'
@@ -119,11 +114,10 @@ jobs:
           errors = []
 
           if source == "pikpak":
-              if not os.environ.get("PIKPAK_TOKEN", "").strip():
-                  if not os.environ.get("EMAIL", "").strip():
-                      errors.append("'email' is required when source_type = pikpak")
-                  if not os.environ.get("PASSWORD", "").strip():
-                      errors.append("'password' is required when source_type = pikpak")
+              if not os.environ.get("EMAIL", "").strip():
+                  errors.append("'email' is required when source_type = pikpak")
+              if not os.environ.get("PASSWORD", "").strip():
+                  errors.append("'password' is required when source_type = pikpak")
           elif source == "direct_links":
               raw = os.environ.get("DIRECT_LINKS", "").strip()
               urls = [line.strip() for line in raw.splitlines()
@@ -150,7 +144,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install "pikpakapi==0.1.11" huggingface_hub cryptography
+          pip install "pikpakapi==0.1.11" huggingface_hub
           sudo apt-get install -y aria2 wget curl
 
       - name: Create directories
@@ -166,8 +160,6 @@ jobs:
         env:
           PIKPAK_EMAIL:         ${{ github.event.inputs.email }}
           PIKPAK_PASSWORD:      ${{ github.event.inputs.password }}
-          PIKPAK_TOKEN:         ${{ github.event.inputs.pikpak_token }}
-          PIKPAK_TOKEN_SECRET:  ${{ secrets.PIKPAK_TOKEN_SECRET }}
           DELETE_AFTER_COLLECT: ${{ github.event.inputs.delete_after_collect }}
         run: |
           cat << 'EOF' > /tmp/collect_links.py
@@ -185,32 +177,8 @@ jobs:
                       url, data=data, headers=headers
                   )
 
-          import base64, time
-
-          def resolve_credentials():
-              token = os.environ.get("PIKPAK_TOKEN", "").strip()
-              if not token:
-                  return os.environ["PIKPAK_EMAIL"], os.environ["PIKPAK_PASSWORD"]
-              from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-              secret = os.environ.get("PIKPAK_TOKEN_SECRET", "")
-              if not secret:
-                  raise SystemExit("PIKPAK_TOKEN_SECRET repo secret is missing.")
-              if not token.startswith("pkt1."):
-                  raise SystemExit("Unsupported token format.")
-              raw = base64.urlsafe_b64decode(token[5:] + "=" * (-len(token[5:]) % 4))
-              key = hashlib.pbkdf2_hmac("sha256", secret.encode(), raw[:16], 100000, 32)
-              try:
-                  p = json.loads(AESGCM(key).decrypt(raw[16:28], raw[28:], None))
-              except Exception:
-                  raise SystemExit("Token could not be decrypted (wrong secret or corrupted token).") from None
-              if p["exp"] < time.time():
-                  raise SystemExit("Token expired. Generate a new one.")
-              for v in (p["u"], p["p"], p["ip"]):
-                  print("::add-mask::" + v.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"), flush=True)
-              print("Token OK")
-              return p["u"], p["p"]
-
-          EMAIL, PASSWORD = resolve_credentials()
+          EMAIL = os.environ["PIKPAK_EMAIL"]
+          PASSWORD = os.environ["PIKPAK_PASSWORD"]
           DO_DELETE = os.environ.get("DELETE_AFTER_COLLECT", "true").lower() == "true"
           MANIFEST = "/tmp/meta/manifest.json"
           MAX_COMPONENT_BYTES = 200
