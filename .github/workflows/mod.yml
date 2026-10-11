@@ -226,7 +226,38 @@ jobs:
                   )
                   if result.get("url"):
                       raise PikpakException("Manual captcha verification required")
+                  self._captcha_expiry = time.monotonic() + max(
+                      0, int(result.get("expires_in", 300)) - 15
+                  )
                   return result
+
+              async def _send_request(self, method, url, data, params, headers):
+                  # The web API needs a valid captcha token for listing too, not just
+                  # signin and individual download URLs. Manage it for ALL drive calls.
+                  target = urlsplit(url)
+                  if target.hostname != self.PIKPAK_API_HOST:
+                      return await super()._send_request(method, url, data, params, headers)
+                  action = method.upper() + ":" + target.path
+                  if not self.captcha_token or time.monotonic() >= getattr(self, "_captcha_expiry", 0):
+                      await self._refresh_drive_captcha(action)
+                  response = await super()._send_request(method, url, data, params, self.get_headers())
+                  try:
+                      error = response.json()
+                  except ValueError:
+                      return response
+                  if isinstance(error, dict) and error.get("error") == "captcha_invalid":
+                      # One fresh-token retry, as in rclone. Never retry review or
+                      # manual-verification responses, and never loop indefinitely.
+                      self.captcha_token = None
+                      await self._refresh_drive_captcha(action)
+                      response = await super()._send_request(method, url, data, params, self.get_headers())
+                  return response
+
+              async def _refresh_drive_captcha(self, action):
+                  result = await self.captcha_init(action)
+                  self.captcha_token = result.get("captcha_token")
+                  if not self.captcha_token:
+                      raise PikpakException("Drive captcha token unavailable; verification required")
 
               async def login(self):
                   result = await self.captcha_init("POST:/v1/auth/signin")
