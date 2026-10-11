@@ -35,6 +35,15 @@ on:
           - "true"
           - "false"
 
+      delete_after_download:
+        description: "Move successfully downloaded files to PikPak trash?  ▸ PAT only; before HF upload"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
       # Direct links (ignored when source_type = pikpak)
       direct_links:
         description: |
@@ -111,6 +120,8 @@ jobs:
           PASSWORD:     ${{ github.event.inputs.password }}
           PIKPAK_PAT:   ${{ github.event.inputs.pikpak_pat }}
           DIRECT_LINKS: ${{ github.event.inputs.direct_links }}
+          DELETE_AFTER_COLLECT: ${{ github.event.inputs.delete_after_collect }}
+          DELETE_AFTER_DOWNLOAD: ${{ github.event.inputs.delete_after_download }}
         run: |
           python - << 'EOF'
           import os, sys
@@ -122,6 +133,12 @@ jobs:
               pat = os.environ.get("PIKPAK_PAT", "").strip()
               email = os.environ.get("EMAIL", "").strip()
               password = os.environ.get("PASSWORD", "").strip()
+              delete_download = os.environ.get("DELETE_AFTER_DOWNLOAD", "false").lower() == "true"
+              delete_collect = os.environ.get("DELETE_AFTER_COLLECT", "false").lower() == "true"
+              if delete_download and not pat:
+                  errors.append("'delete_after_download' requires 'pikpak_pat'")
+              if delete_download and delete_collect:
+                  errors.append("choose only one deletion option: after collecting OR after downloading")
               if not pat and (not email or not password):
                   errors.append("provide 'pikpak_pat' or both 'email' and 'password' when source_type = pikpak")
           elif source == "direct_links":
@@ -308,9 +325,9 @@ jobs:
           EMAIL = os.environ.get("PIKPAK_EMAIL", "").strip()
           PASSWORD = os.environ.get("PIKPAK_PASSWORD", "")
           PIKPAK_PAT = os.environ.get("PIKPAK_PAT", "").strip()
-          # PATs are read-only: never attempt deletion when one is selected.
-          DO_DELETE = (not PIKPAK_PAT
-                       and os.environ.get("DELETE_AFTER_COLLECT", "false").lower() == "true")
+          # Honor the selected delete-after-collect setting for both PAT and
+          # email/password authentication. Any API refusal is reported per item.
+          DO_DELETE = os.environ.get("DELETE_AFTER_COLLECT", "false").lower() == "true"
           MANIFEST = "/tmp/meta/manifest.json"
           MAX_COMPONENT_BYTES = 200
 
@@ -437,7 +454,10 @@ jobs:
                               masked = url.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
                               print(f"::add-mask::{masked}", flush=True)
                               fname = safe_name(name)
-                              entries.append({"save_path": save_path, "name": fname, "url": url})
+                              entries.append({
+                                  "save_path": save_path, "name": fname, "url": url,
+                                  "pikpak_file_id": item_id, "source_size": item.get("size"),
+                              })
                               print(f"[{len(entries):>3}] Collected: {os.path.join(folder_path, fname)}")
                               if fname != name:
                                   print(f"Truncated from {len(name.encode('utf-8'))}-byte original name")
@@ -458,7 +478,8 @@ jobs:
               finally:
                   await client.httpx_client.aclose()
 
-          asyncio.run(collect_all())
+          if __name__ == "__main__":
+              asyncio.run(collect_all())
           EOF
           python /tmp/collect_links.py
 
@@ -540,6 +561,7 @@ jobs:
 
       # PHASE 2: Download all files.
       - name: Download files
+        id: download_files
         env:
           SOURCE_TYPE: ${{ github.event.inputs.source_type }}
           DOWNLOADER:  ${{ github.event.inputs.downloader }}
@@ -551,6 +573,16 @@ jobs:
           SOURCE_TYPE = os.environ.get("SOURCE_TYPE", "pikpak")
           DL_CHOICE = os.environ.get("DOWNLOADER", "auto").lower()
           MAX_COMPONENT_BYTES = 200
+          RECEIPTS = "/tmp/meta/downloaded.json"
+          downloaded = []
+
+          def save_receipts():
+              # Atomic, incremental receipts survive a later download failure.
+              with open(RECEIPTS + ".tmp", "w", encoding="utf-8") as f:
+                  json.dump(downloaded, f)
+              os.replace(RECEIPTS + ".tmp", RECEIPTS)
+
+          save_receipts()
 
           def safe_name(name: str) -> str:
               name = (name or "").strip().replace("/", "_").replace("\\", "_") or "file"
@@ -584,6 +616,8 @@ jobs:
                   "--split=16",
                   "--min-split-size=1M",
                   "--file-allocation=none",
+                  "--auto-file-renaming=false",
+                  "--allow-overwrite=true",
                   "--user-agent=Mozilla/5.0",
                   "--header=Referer: https://mypikpak.com",
                   "--console-log-level=notice",
@@ -632,6 +666,24 @@ jobs:
               if ret == 0:
                   dest = os.path.join(save_path, name)
                   size = os.path.getsize(dest) if os.path.exists(dest) else 0
+                  if not os.path.isfile(dest) or os.path.exists(dest + ".aria2"):
+                      print(f"Failed: {name} (completed output file not found)")
+                      failed.append(name)
+                      continue
+                  expected = entry.get("source_size")
+                  try:
+                      expected = int(expected) if expected is not None else None
+                  except (TypeError, ValueError):
+                      expected = None
+                  if expected is not None and expected >= 0 and size != expected:
+                      print(f"Failed: {name} (size mismatch: {size} != {expected} bytes)")
+                      failed.append(name)
+                      continue
+                  downloaded.append({
+                      "pikpak_file_id": entry.get("pikpak_file_id"),
+                      "path": dest, "size": size,
+                  })
+                  save_receipts()
                   print(f"Done: {name} ({size / 1024 / 1024:.2f} MB)")
                   success += 1
               else:
@@ -648,6 +700,92 @@ jobs:
               sys.exit(1)
           EOF
           python /tmp/download_files.py
+
+      # Only receipt-backed successful downloads are trashed. This step also
+      # runs after partial download failure, but never after cancellation.
+      # PAT is used directly: no password login, refresh, or token persistence.
+      - name: "[PikPak PAT] Trash successfully downloaded files"
+        if: ${{ !cancelled() && github.event.inputs.source_type == 'pikpak' && github.event.inputs.delete_after_download == 'true' && (steps.download_files.outcome == 'success' || steps.download_files.outcome == 'failure') }}
+        env:
+          PIKPAK_PAT: ${{ github.event.inputs.pikpak_pat }}
+        run: |
+          cat << 'EOF' > /tmp/delete_downloaded.py
+          import asyncio, json, os, sys
+          from collections import Counter
+          from collect_links import PikPakWebClient
+
+          async def main():
+              pat = os.environ.get("PIKPAK_PAT", "").strip()
+              if not pat:
+                  print("Deletion refused: PAT is required.")
+                  return 1
+              receipts_path = "/tmp/meta/downloaded.json"
+              if not os.path.isfile(receipts_path):
+                  print("No successful-download receipts; nothing will be deleted.")
+                  return 0
+              with open(receipts_path, encoding="utf-8") as f:
+                  receipts = json.load(f)
+              with open("/tmp/meta/manifest.json", encoding="utf-8") as f:
+                  manifest = json.load(f)
+              paths = Counter(os.path.join(e["save_path"], e["name"]) for e in manifest)
+              client = PikPakWebClient(
+                  username="__pikpak_pat__", password="__pikpak_pat__",
+                  request_max_retries=2, httpx_client_args={"timeout": 30},
+              )
+              client.access_token = pat
+              # Never fall back to password login or refresh an unrelated session.
+              async def no_refresh():
+                  raise RuntimeError("PAT rejected or expired; supply a valid PAT")
+              client.refresh_access_token = no_refresh
+              trashed, skipped, failed = 0, 0, 0
+              seen = set()
+              try:
+                  for receipt in receipts:
+                      file_id, path = receipt.get("pikpak_file_id"), receipt["path"]
+                      name = os.path.relpath(path, "/tmp/pikpak")
+                      if not file_id or file_id in seen:
+                          skipped += 1
+                          continue
+                      if (paths[path] != 1 or not os.path.isfile(path)
+                              or os.path.exists(path + ".aria2")
+                              or os.path.getsize(path) != receipt["size"]):
+                          print(f"Kept in PikPak: {name} (missing, changed, or ambiguous local output)")
+                          skipped += 1
+                          continue
+                      seen.add(file_id)
+                      try:
+                          await client.delete_to_trash([file_id])
+                          trashed += 1
+                          print(f"Moved to PikPak trash: {name}")
+                      except Exception as exc:
+                          failed += 1
+                          # Do not expose API bodies, URLs, or credentials.
+                          message = str(exc).lower()
+                          reason = ("PAT rejected/expired or missing delete permission"
+                                    if any(s in message for s in ("401", "403", "unauthor", "forbidden", "pat rejected", "scope", "permission"))
+                                    else "verification required" if any(s in message for s in ("captcha", "review"))
+                                    else "network timeout" if "timeout" in message
+                                    else "API request failed")
+                          print(f"Could not trash: {name} ({reason}); local download retained.")
+                  summary = f"PikPak deletion: {trashed} trashed, {skipped} skipped, {failed} failed."
+                  print(summary)
+                  print("Folders are retained. Deletion happens before HuggingFace upload.")
+                  if os.environ.get("GITHUB_STEP_SUMMARY"):
+                      with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+                          f.write("\n## PAT delete-after-download\n\n" + summary + "\n")
+                          f.write("Folders retained; failed downloads not deleted. Deletion precedes HF upload.\n")
+              finally:
+                  await client.httpx_client.aclose()
+              # A deletion refusal must not block uploading successful downloads.
+              # Mark the run failed AFTER upload instead, using a separate check.
+              with open("/tmp/meta/deletion_failed", "w", encoding="utf-8") as f:
+                  f.write(str(failed))
+              return 0
+
+          if __name__ == "__main__":
+              sys.exit(asyncio.run(main()))
+          EOF
+          python /tmp/delete_downloaded.py
 
       - name: List downloaded files
         run: find /tmp/pikpak/ -type f -exec ls -lh {} \;
@@ -684,3 +822,11 @@ jobs:
           print("Upload complete!")
           EOF
           python /tmp/hf_upload.py
+
+      - name: Report PAT deletion failures
+        if: ${{ !cancelled() && github.event.inputs.source_type == 'pikpak' && github.event.inputs.delete_after_download == 'true' }}
+        run: |
+          if [ -f /tmp/meta/deletion_failed ] && [ "$(< /tmp/meta/deletion_failed)" != "0" ]; then
+            echo "::error::Some PikPak files could not be moved to trash. See the PAT deletion step."
+            exit 1
+          fi
