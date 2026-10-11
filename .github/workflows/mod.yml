@@ -19,7 +19,11 @@ on:
         description: "PikPak Email  ▸ pikpak only"
         required: false
       password:
-        description: "PikPak Password  ▸ pikpak only"
+        description: "PikPak Password  ▸ required when no PAT is supplied"
+        required: false
+        type: string
+      pikpak_pat:
+        description: "PikPak Personal Access Token  ▸ alternative to email/password"
         required: false
         type: string
       delete_after_collect:
@@ -88,7 +92,7 @@ jobs:
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
               inputs = json.load(f).get("inputs", {})
 
-          for key in ("email", "password", "hf_token", "direct_links"):
+          for key in ("email", "password", "pikpak_pat", "hf_token", "direct_links"):
               value = inputs.get(key, "")
               if not value:
                   continue
@@ -105,6 +109,7 @@ jobs:
           SOURCE_TYPE:  ${{ github.event.inputs.source_type }}
           EMAIL:        ${{ github.event.inputs.email }}
           PASSWORD:     ${{ github.event.inputs.password }}
+          PIKPAK_PAT:   ${{ github.event.inputs.pikpak_pat }}
           DIRECT_LINKS: ${{ github.event.inputs.direct_links }}
         run: |
           python - << 'EOF'
@@ -114,10 +119,11 @@ jobs:
           errors = []
 
           if source == "pikpak":
-              if not os.environ.get("EMAIL", "").strip():
-                  errors.append("'email' is required when source_type = pikpak")
-              if not os.environ.get("PASSWORD", "").strip():
-                  errors.append("'password' is required when source_type = pikpak")
+              pat = os.environ.get("PIKPAK_PAT", "").strip()
+              email = os.environ.get("EMAIL", "").strip()
+              password = os.environ.get("PASSWORD", "").strip()
+              if not pat and (not email or not password):
+                  errors.append("provide 'pikpak_pat' or both 'email' and 'password' when source_type = pikpak")
           elif source == "direct_links":
               raw = os.environ.get("DIRECT_LINKS", "").strip()
               urls = [line.strip() for line in raw.splitlines()
@@ -158,9 +164,11 @@ jobs:
       - name: "[PikPak] Collect all download links (+ optional delete)"
         if: ${{ github.event.inputs.source_type == 'pikpak' }}
         env:
-          PIKPAK_EMAIL:         ${{ github.event.inputs.email }}
-          PIKPAK_PASSWORD:      ${{ github.event.inputs.password }}
-          DELETE_AFTER_COLLECT: ${{ github.event.inputs.delete_after_collect }}
+           PIKPAK_EMAIL:         ${{ github.event.inputs.email }}
+           PIKPAK_PASSWORD:      ${{ github.event.inputs.password }}
+           PIKPAK_PAT:           ${{ github.event.inputs.pikpak_pat }}
+           DELETE_AFTER_COLLECT: ${{ github.event.inputs.delete_after_collect }}
+
         run: |
           cat << 'EOF' > /tmp/collect_links.py
           import os, json, asyncio, hashlib, re, time
@@ -297,9 +305,12 @@ jobs:
                   if self.token_refresh_callback:
                       await self.token_refresh_callback(self, **self.token_refresh_callback_kwargs)
 
-          EMAIL = os.environ["PIKPAK_EMAIL"]
-          PASSWORD = os.environ["PIKPAK_PASSWORD"]
-          DO_DELETE = os.environ.get("DELETE_AFTER_COLLECT", "false").lower() == "true"
+          EMAIL = os.environ.get("PIKPAK_EMAIL", "").strip()
+          PASSWORD = os.environ.get("PIKPAK_PASSWORD", "")
+          PIKPAK_PAT = os.environ.get("PIKPAK_PAT", "").strip()
+          # PATs are read-only: never attempt deletion when one is selected.
+          DO_DELETE = (not PIKPAK_PAT
+                       and os.environ.get("DELETE_AFTER_COLLECT", "false").lower() == "true")
           MANIFEST = "/tmp/meta/manifest.json"
           MAX_COMPONENT_BYTES = 200
 
@@ -322,8 +333,10 @@ jobs:
                   username=EMAIL, password=PASSWORD, request_max_retries=2,
                   httpx_client_args={"timeout": 30},
               )
-              # Observe only failed authentication responses. Never log bodies,
-              # request headers, captcha URLs, or successful token responses.
+              # A PAT is already an access token. It is supplied by the dispatch,
+              # never printed, and skips the password sign-in flow.
+              if PIKPAK_PAT:
+                  client.access_token = PIKPAK_PAT
               diagnostics = []
 
               async def auth_diagnostic(response):
@@ -339,14 +352,13 @@ jobs:
                       payload = {}
                   if response.status_code < 400 and not payload.get("error"):
                       return
-                  # Only symbolic codes; deliberately omit free-text descriptions.
                   fields = []
                   for key in ("error", "error_code", "code"):
                       value = payload.get(key)
                       if isinstance(value, (str, int)) and not isinstance(value, bool):
                           value = str(value)
                           if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", value):
-                              if value not in (EMAIL, PASSWORD):
+                              if value not in (EMAIL, PASSWORD, PIKPAK_PAT):
                                   fields.append(f"{key}={value}")
                   endpoint = "signin" if path.endswith("/signin") else "authentication"
                   diagnostics.append(
@@ -356,10 +368,12 @@ jobs:
 
               client.httpx_client.event_hooks.setdefault("response", []).append(auth_diagnostic)
               try:
-                  await client.login()
+                  if PIKPAK_PAT:
+                      print("Using PikPak Personal Access Token.")
+                  else:
+                      await client.login()
               except Exception as exc:
                   await client.httpx_client.aclose()
-                  # Exception text may contain secrets: classify it, never print it.
                   message = str(exc).lower()
                   if "review" in message:
                       category = "review / verification rejection"
@@ -372,24 +386,21 @@ jobs:
                   else:
                       category = "unclassified login failure"
                   lines = [
-                      "PikPak login failed: " + category,
+                      "PikPak authentication failed: " + category,
                       *diagnostics,
-                      "Client: pikpakapi 0.1.11 with web-client login, captcha and refresh protocol.",
                       "No files were collected or deleted.",
                       "Do not repeatedly retry a review/captcha rejection.",
-                      "If verification is required, this workflow cannot complete it automatically.",
-                      "If review persists with the web client, PikPak is still refusing authentication; no retry bypass is attempted.",
                   ]
                   for line in lines:
                       print(line, flush=True)
                   summary = os.environ.get("GITHUB_STEP_SUMMARY")
                   if summary:
                       with open(summary, "a", encoding="utf-8") as f:
-                          f.write("## PikPak login diagnostics\n\n")
+                          f.write("## PikPak authentication diagnostics\n\n")
                           f.write("\n".join("- " + line for line in lines) + "\n")
                   raise SystemExit(1) from None
 
-              print("Logged in - crawling file tree...")
+              print("Authenticated - crawling file tree...")
               print(f"Delete-after-collect {'ENABLED' if DO_DELETE else 'DISABLED'}\n")
               entries = []
 
