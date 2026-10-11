@@ -1,4 +1,4 @@
-name: PikPak / Direct Link → HuggingFace Transfer
+name: PikPak / Direct Link → HuggingFace Transfer (Web Login)
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ on:
       delete_after_collect:
         description: "Delete files from PikPak after collecting links?  ▸ pikpak only"
         required: false
-        default: "true"
+        default: "false"
         type: choice
         options:
           - "true"
@@ -163,23 +163,112 @@ jobs:
           DELETE_AFTER_COLLECT: ${{ github.event.inputs.delete_after_collect }}
         run: |
           cat << 'EOF' > /tmp/collect_links.py
-          import os, json, asyncio, hashlib
+          import os, json, asyncio, hashlib, re, time
+          from urllib.parse import urlsplit
           from pikpakapi import PikPakApi
           from pikpakapi.PikpakException import PikpakException
 
-          class PikPakLoginFix(PikPakApi):
-              async def _request_post(self, url, data=None, headers=None):
-                  if url.endswith("/v1/auth/signin"):
-                      # pikpakapi 0.1.11 sends JSON but declares form encoding.
-                      # Match the body and restore normal client/device headers.
-                      headers = self.get_headers()
-                  return await super()._request_post(
-                      url, data=data, headers=headers
+          class PikPakWebClient(PikPakApi):
+              # Web-client protocol used by rclone's maintained PikPak backend.
+              # References: github.com/rclone/rclone/backend/pikpak/{pikpak,helper}.go
+              WEB_CLIENT_ID = 'YUMx5nI8ZU8Ap8pm'
+              WEB_VERSION = '2.0.0'
+              WEB_PACKAGE = 'mypikpak.com'
+              WEB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0'
+              WEB_SALTS = ['C9qPpZLN8ucRTaTiUMWYS9cQvWOE', '+r6CQVxjzJV6LCV', 'F', 'pFJRC', '9WXYIDGrwTCz2OiVlgZa90qpECPD6olt', '/750aCr4lm/Sly/c', 'RB+DT/gZCrbV', '', 'CyLsf7hdkIRxRm215hl', '7xHvLi2tOYP0Y92b', 'ZGTXXxu8E/MIWaEDB+Sm/', '1UI3', 'E7fP5Pfijd+7K+t6Tg/NhuLq0eEUVChpJSkrKxpO', 'ihtqpG6FMt65+Xk+tWUH2', 'NhXXU9rg4XXdzo7u5o']
+
+              def get_headers(self, access_token=None):
+                  headers = {
+                      "User-Agent": self.WEB_UA,
+                      "Content-Type": "application/json; charset=utf-8",
+                      "Referer": "https://mypikpak.com/",
+                      "X-Client-Id": self.WEB_CLIENT_ID,
+                      "X-Client-Version": self.WEB_VERSION,
+                      "X-Device-Id": self.device_id,
+                  }
+                  token = access_token or self.access_token
+                  if token:
+                      headers["Authorization"] = "Bearer " + token
+                  if self.captcha_token:
+                      headers["X-Captcha-Token"] = self.captcha_token
+                  return headers
+
+              async def captcha_init(self, action, meta=None):
+                  # Captcha actions use METHOD:/path, not METHOD:https://host/path.
+                  method, target = action.split(":", 1)
+                  if target.startswith(("https://", "http://")):
+                      target = urlsplit(target).path
+                  action = method + ":" + target
+                  if action == "POST:/v1/auth/signin":
+                      meta = {"username": self.username}
+                  else:
+                      timestamp = str(time.time_ns() // 1_000_000)
+                      signature = (self.WEB_CLIENT_ID + self.WEB_VERSION
+                                   + self.WEB_PACKAGE + self.device_id + timestamp)
+                      for salt in self.WEB_SALTS:
+                          signature = hashlib.md5((signature + salt).encode()).hexdigest()
+                      meta = {
+                          "captcha_sign": "1." + signature,
+                          "timestamp": timestamp,
+                          "client_version": self.WEB_VERSION,
+                          "package_name": self.WEB_PACKAGE,
+                          "user_id": self.user_id or "",
+                      }
+                  result = await self._request_post(
+                      "https://user.mypikpak.com/v1/shield/captcha/init",
+                      data={
+                          "client_id": self.WEB_CLIENT_ID,
+                          "device_id": self.device_id,
+                          "action": action,
+                          "captcha_token": self.captcha_token or "",
+                          "meta": meta,
+                      },
                   )
+                  if result.get("url"):
+                      raise PikpakException("Manual captcha verification required")
+                  return result
+
+              async def login(self):
+                  result = await self.captcha_init("POST:/v1/auth/signin")
+                  self.captcha_token = result.get("captcha_token")
+                  if not self.captcha_token:
+                      raise PikpakException("captcha_token get failed")
+                  result = await self._request_post(
+                      "https://user.mypikpak.com/v1/auth/signin",
+                      data={
+                          "client_id": self.WEB_CLIENT_ID,
+                          "username": self.username,
+                          "password": self.password,
+                      },
+                  )
+                  self.access_token = result["access_token"]
+                  self.refresh_token = result["refresh_token"]
+                  self.user_id = result["sub"]
+                  self.captcha_token = None
+                  self.encode_token()
+
+              async def refresh_access_token(self):
+                  # Refresh with the SAME client ID that issued the token.
+                  if not self.refresh_token:
+                      raise PikpakException("Authentication failed; no refresh token")
+                  result = await self._request_post(
+                      "https://user.mypikpak.com/v1/auth/token",
+                      data={
+                          "client_id": self.WEB_CLIENT_ID,
+                          "refresh_token": self.refresh_token,
+                          "grant_type": "refresh_token",
+                      },
+                  )
+                  self.access_token = result["access_token"]
+                  self.refresh_token = result["refresh_token"]
+                  self.user_id = result["sub"]
+                  self.encode_token()
+                  if self.token_refresh_callback:
+                      await self.token_refresh_callback(self, **self.token_refresh_callback_kwargs)
 
           EMAIL = os.environ["PIKPAK_EMAIL"]
           PASSWORD = os.environ["PIKPAK_PASSWORD"]
-          DO_DELETE = os.environ.get("DELETE_AFTER_COLLECT", "true").lower() == "true"
+          DO_DELETE = os.environ.get("DELETE_AFTER_COLLECT", "false").lower() == "true"
           MANIFEST = "/tmp/meta/manifest.json"
           MAX_COMPONENT_BYTES = 200
 
@@ -198,21 +287,76 @@ jobs:
               return f"{base}_{digest}{ext}"
 
           async def collect_all():
-              client = PikPakLoginFix(username=EMAIL, password=PASSWORD)
+              client = PikPakWebClient(
+                  username=EMAIL, password=PASSWORD, request_max_retries=2,
+                  httpx_client_args={"timeout": 30},
+              )
+              # Observe only failed authentication responses. Never log bodies,
+              # request headers, captcha URLs, or successful token responses.
+              diagnostics = []
+
+              async def auth_diagnostic(response):
+                  path = response.request.url.path
+                  if not ("/auth/" in path or "/captcha/" in path):
+                      return
+                  try:
+                      await response.aread()
+                      payload = response.json()
+                  except Exception:
+                      payload = {}
+                  if not isinstance(payload, dict):
+                      payload = {}
+                  if response.status_code < 400 and not payload.get("error"):
+                      return
+                  # Only symbolic codes; deliberately omit free-text descriptions.
+                  fields = []
+                  for key in ("error", "error_code", "code"):
+                      value = payload.get(key)
+                      if isinstance(value, (str, int)) and not isinstance(value, bool):
+                          value = str(value)
+                          if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", value):
+                              if value not in (EMAIL, PASSWORD):
+                                  fields.append(f"{key}={value}")
+                  endpoint = "signin" if path.endswith("/signin") else "authentication"
+                  diagnostics.append(
+                      f"{endpoint}: HTTP {response.status_code}; "
+                      + (", ".join(fields) or "no safe symbolic error code")
+                  )
+
+              client.httpx_client.event_hooks.setdefault("response", []).append(auth_diagnostic)
               try:
                   await client.login()
-              except PikpakException as exc:
+              except Exception as exc:
                   await client.httpx_client.aclose()
-                  if "review" in str(exc).lower():
-                      raise SystemExit(
-                          "PikPak rejected login with a review response. "
-                          "The JSON/header patch did not resolve this rejection. "
-                          "Sign in through the official PikPak app or website, "
-                          "complete any requested verification, and contact "
-                          "PikPak support if the rejection persists. "
-                          "No files were collected or deleted in this attempt."
-                      ) from None
-                  raise
+                  # Exception text may contain secrets: classify it, never print it.
+                  message = str(exc).lower()
+                  if "review" in message:
+                      category = "review / verification rejection"
+                  elif "captcha" in message:
+                      category = "captcha / verification required"
+                  elif "password" in message or "credential" in message:
+                      category = "credential-related rejection"
+                  elif "timeout" in message:
+                      category = "network timeout"
+                  else:
+                      category = "unclassified login failure"
+                  lines = [
+                      "PikPak login failed: " + category,
+                      *diagnostics,
+                      "Client: pikpakapi 0.1.11 with web-client login, captcha and refresh protocol.",
+                      "No files were collected or deleted.",
+                      "Do not repeatedly retry a review/captcha rejection.",
+                      "If verification is required, this workflow cannot complete it automatically.",
+                      "If review persists with the web client, PikPak is still refusing authentication; no retry bypass is attempted.",
+                  ]
+                  for line in lines:
+                      print(line, flush=True)
+                  summary = os.environ.get("GITHUB_STEP_SUMMARY")
+                  if summary:
+                      with open(summary, "a", encoding="utf-8") as f:
+                          f.write("## PikPak login diagnostics\n\n")
+                          f.write("\n".join("- " + line for line in lines) + "\n")
+                  raise SystemExit(1) from None
 
               print("Logged in - crawling file tree...")
               print(f"Delete-after-collect {'ENABLED' if DO_DELETE else 'DISABLED'}\n")
@@ -243,6 +387,8 @@ jobs:
                           try:
                               res = await client.get_download_url(item_id)
                               url = res["web_content_link"]
+                              masked = url.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                              print(f"::add-mask::{masked}", flush=True)
                               fname = safe_name(name)
                               entries.append({"save_path": save_path, "name": fname, "url": url})
                               print(f"[{len(entries):>3}] Collected: {os.path.join(folder_path, fname)}")
@@ -305,6 +451,8 @@ jobs:
 
               parts = line.split(None, 1)
               url = parts[0]
+              masked = url.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::add-mask::{masked}", flush=True)
               if len(parts) == 2:
                   custom = parts[1].strip().replace("\\", "/")
                   name = safe_name(os.path.basename(custom))
@@ -320,7 +468,7 @@ jobs:
               entries.append({"save_path": save_path, "name": name, "url": url})
               display = os.path.relpath(os.path.join(save_path, name), SAVE_DIR)
               print(f"[{len(entries):>3}] {display}")
-              print(f"Source: {url[:80]}{'...' if len(url) > 80 else ''}")
+              print("Source URL hidden for privacy.")
 
           with open(MANIFEST, "w") as f:
               json.dump(entries, f, indent=2)
@@ -335,12 +483,11 @@ jobs:
           import json, os
           with open("/tmp/meta/manifest.json") as f:
               entries = json.load(f)
-          print(f"{'#':>4}  {'HF path':<45}  URL")
+          print(f"{'#':>4}  {'HF path':<45}")
           print("-" * 105)
           for i, e in enumerate(entries, 1):
               rel = os.path.relpath(os.path.join(e["save_path"], e["name"]), "/tmp/pikpak/")
-              preview = e["url"][:55] + "..." if len(e["url"]) > 55 else e["url"]
-              print(f"{i:>4}  {rel:<45}  {preview}")
+              print(f"{i:>4}  {rel:<45}")
           print(f"\nTotal: {len(entries)} file(s) queued.")
           EOF
 
@@ -410,7 +557,7 @@ jobs:
 
           def cmd_curl(url, save_path, name):
               return [
-                  "curl", "-L",
+                  "curl", "--fail", "-L",
                   "--progress-bar",
                   "-A", "Mozilla/5.0",
                   "-o", os.path.join(save_path, name),
@@ -432,7 +579,7 @@ jobs:
               name = safe_name(name)
               os.makedirs(save_path, exist_ok=True)
               print(f"\n[{idx}/{total}] Downloading: {name}")
-              print(f"Source: {url[:80]}{'...' if len(url) > 80 else ''}")
+              print("Source URL hidden for privacy.")
               ret = subprocess.run(build_cmd(url, save_path, name)).returncode
 
               if ret == 0:
