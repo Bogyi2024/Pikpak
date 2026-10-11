@@ -329,12 +329,17 @@ jobs:
               return f"{base}_{digest}{ext}"
 
           async def collect_all():
+              # pikpakapi 0.1.11 rejects construction without either a credential
+              # pair or its own encoded-token format. PAT mode never calls login:
+              # these inert values only satisfy that local constructor guard.
               client = PikPakWebClient(
-                  username=EMAIL, password=PASSWORD, request_max_retries=2,
+                  username=EMAIL or "__pikpak_pat__",
+                  password=PASSWORD or "__pikpak_pat__",
+                  request_max_retries=2,
                   httpx_client_args={"timeout": 30},
               )
               # A PAT is already an access token. It is supplied by the dispatch,
-              # never printed, and skips the password sign-in flow.
+              # never printed, and replaces the placeholder before any API request.
               if PIKPAK_PAT:
                   client.access_token = PIKPAK_PAT
               diagnostics = []
