@@ -1,0 +1,843 @@
+name: PikPak / Direct Link → HuggingFace Transfer (Web Login)
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      # Source
+      source_type:
+        description: "Download source"
+        required: true
+        default: "pikpak"
+        type: choice
+        options:
+          - pikpak
+          - direct_links
+
+      # PikPak (ignored when source_type = direct_links)
+      email:
+        description: "PikPak Email  ▸ pikpak only"
+        required: false
+      password:
+        description: "PikPak Password  ▸ required when no PAT is supplied"
+        required: false
+        type: string
+      pikpak_pat:
+        description: "PikPak Personal Access Token  ▸ alternative to email/password"
+        required: false
+        type: string
+      delete_after_collect:
+        description: "Delete files from PikPak after collecting links?  ▸ pikpak only"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+      delete_after_download:
+        description: "Move successfully downloaded files to PikPak trash?  ▸ PAT only; before HF upload"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+      # Direct links (ignored when source_type = pikpak)
+      direct_links:
+        description: |
+          Direct download URLs  ▸ direct_links only
+          • Multiple URLs supported — one per line
+          • Optional custom filename / subpath after the URL:
+              https://example.com/model.bin
+              https://example.com/weights.pt   my-weights.pt
+              https://example.com/data.zip     subdir/data.zip
+        required: false
+
+      # Downloader
+      downloader:
+        description: "Downloader  (auto → aria2c for pikpak, wget for direct_links)"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - aria2c
+          - wget
+          - curl
+
+      # HuggingFace
+      hf_token:
+        description: "HuggingFace Token"
+        required: true
+        type: string
+      repo_id:
+        description: "HuggingFace Repo ID (e.g. username/reponame)"
+        required: true
+      repo_type:
+        description: "HuggingFace Repo Type"
+        required: true
+        type: choice
+        options:
+          - model
+          - dataset
+          - space
+
+jobs:
+  transfer:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Mask sensitive inputs
+        run: |
+          cat << 'EOF' > "$RUNNER_TEMP/mask_inputs.py"
+          import json, os
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
+              inputs = json.load(f).get("inputs", {})
+
+          for key in ("email", "password", "pikpak_pat", "hf_token", "direct_links"):
+              value = inputs.get(key, "")
+              if not value:
+                  continue
+              value = str(value)
+              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::add-mask::{escaped}", flush=True)
+          EOF
+          python "$RUNNER_TEMP/mask_inputs.py"
+
+      - name: Validate inputs
+        env:
+          SOURCE_TYPE:           ${{ github.event.inputs.source_type }}
+          EMAIL:                 ${{ github.event.inputs.email }}
+          PASSWORD:              ${{ github.event.inputs.password }}
+          PIKPAK_PAT:            ${{ github.event.inputs.pikpak_pat }}
+          DIRECT_LINKS:          ${{ github.event.inputs.direct_links }}
+          DELETE_AFTER_COLLECT:  ${{ github.event.inputs.delete_after_collect }}
+          DELETE_AFTER_DOWNLOAD: ${{ github.event.inputs.delete_after_download }}
+        run: |
+          cat << 'EOF' > "$RUNNER_TEMP/validate.py"
+          import os, sys
+
+          source = os.environ.get("SOURCE_TYPE", "")
+          errors = []
+
+          if source == "pikpak":
+              pat = os.environ.get("PIKPAK_PAT", "").strip()
+              email = os.environ.get("EMAIL", "").strip()
+              password = os.environ.get("PASSWORD", "").strip()
+              delete_download = os.environ.get("DELETE_AFTER_DOWNLOAD", "false").lower() == "true"
+              delete_collect = os.environ.get("DELETE_AFTER_COLLECT", "false").lower() == "true"
+              if delete_download and not pat:
+                  errors.append("'delete_after_download' requires 'pikpak_pat'")
+              if delete_download and delete_collect:
+                  errors.append("choose only one deletion option: after collecting OR after downloading")
+              if not pat and (not email or not password):
+                  errors.append("provide 'pikpak_pat' or both 'email' and 'password' when source_type = pikpak")
+          elif source == "direct_links":
+              raw = os.environ.get("DIRECT_LINKS", "").strip()
+              urls = [line.strip() for line in raw.splitlines()
+                      if line.strip() and not line.strip().startswith("#")]
+              if not urls:
+                  errors.append("'direct_links' must contain at least one URL "
+                                "when source_type = direct_links")
+              else:
+                  print(f"{len(urls)} URL(s) detected in direct_links")
+          else:
+              errors.append(f"Unknown source_type: {source!r}")
+
+          if errors:
+              print("\n".join(errors))
+              sys.exit(1)
+
+          print(f"Validation passed (source: {source})")
+          EOF
+          python "$RUNNER_TEMP/validate.py"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "pikpakapi==0.1.11" huggingface_hub
+          choco install aria2 wget curl -y --no-progress
+
+      - name: Create working directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/pikpak"
+          mkdir -p "$RUNNER_TEMP/meta"
+
+      # PHASE 1-A: PikPak - collect download links
+      - name: "[PikPak] Collect all download links (+ optional delete)"
+        if: ${{ github.event.inputs.source_type == 'pikpak' }}
+        env:
+          PIKPAK_EMAIL:         ${{ github.event.inputs.email }}
+          PIKPAK_PASSWORD:      ${{ github.event.inputs.password }}
+          PIKPAK_PAT:           ${{ github.event.inputs.pikpak_pat }}
+          DELETE_AFTER_COLLECT: ${{ github.event.inputs.delete_after_collect }}
+        run: |
+          cat << 'EOF' > "$RUNNER_TEMP/collect_links.py"
+          import os, json, asyncio, hashlib, re, time
+          from urllib.parse import urlsplit
+          from pikpakapi import PikPakApi
+          from pikpakapi.PikpakException import PikpakException
+
+          RUNNER_TEMP = os.environ.get("RUNNER_TEMP", ".")
+          STORAGE_DIR = os.path.join(RUNNER_TEMP, "pikpak")
+          MANIFEST = os.path.join(RUNNER_TEMP, "meta", "manifest.json")
+
+          class PikPakWebClient(PikPakApi):
+              WEB_CLIENT_ID = 'YUMx5nI8ZU8Ap8pm'
+              WEB_VERSION = '2.0.0'
+              WEB_PACKAGE = 'mypikpak.com'
+              WEB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0'
+              WEB_SALTS = ['C9qPpZLN8ucRTaTiUMWYS9cQvWOE', '+r6CQVxjzJV6LCV', 'F', 'pFJRC', '9WXYIDGrwTCz2OiVlgZa90qpECPD6olt', '/750aCr4lm/Sly/c', 'RB+DT/gZCrbV', '', 'CyLsf7hdkIRxRm215hl', '7xHvLi2tOYP0Y92b', 'ZGTXXxu8E/MIWaEDB+Sm/', '1UI3', 'E7fP5Pfijd+7K+t6Tg/NhuLq0eEUVChpJSkrKxpO', 'ihtqpG6FMt65+Xk+tWUH2', 'NhXXU9rg4XXdzo7u5o']
+
+              def get_headers(self, access_token=None):
+                  headers = {
+                      "User-Agent": self.WEB_UA,
+                      "Content-Type": "application/json; charset=utf-8",
+                      "Referer": "https://mypikpak.com/",
+                      "X-Client-Id": self.WEB_CLIENT_ID,
+                      "X-Client-Version": self.WEB_VERSION,
+                      "X-Device-Id": self.device_id,
+                  }
+                  token = access_token or self.access_token
+                  if token:
+                      headers["Authorization"] = "Bearer " + token
+                  if self.captcha_token:
+                      headers["X-Captcha-Token"] = self.captcha_token
+                  return headers
+
+              async def captcha_init(self, action, meta=None):
+                  method, target = action.split(":", 1)
+                  if target.startswith(("https://", "http://")):
+                      target = urlsplit(target).path
+                  action = method + ":" + target
+                  if action == "POST:/v1/auth/signin":
+                      meta = {"username": self.username}
+                  else:
+                      timestamp = str(time.time_ns() // 1_000_000)
+                      signature = (self.WEB_CLIENT_ID + self.WEB_VERSION
+                                   + self.WEB_PACKAGE + self.device_id + timestamp)
+                      for salt in self.WEB_SALTS:
+                          signature = hashlib.md5((signature + salt).encode()).hexdigest()
+                      meta = {
+                          "captcha_sign": "1." + signature,
+                          "timestamp": timestamp,
+                          "client_version": self.WEB_VERSION,
+                          "package_name": self.WEB_PACKAGE,
+                          "user_id": self.user_id or "",
+                      }
+                  result = await self._request_post(
+                      "https://user.mypikpak.com/v1/shield/captcha/init",
+                      data={
+                          "client_id": self.WEB_CLIENT_ID,
+                          "device_id": self.device_id,
+                          "action": action,
+                          "captcha_token": self.captcha_token or "",
+                          "meta": meta,
+                      },
+                  )
+                  if result.get("url"):
+                      raise PikpakException("Manual captcha verification required")
+                  self._captcha_expiry = time.monotonic() + max(
+                      0, int(result.get("expires_in", 300)) - 15
+                  )
+                  return result
+
+              async def _send_request(self, method, url, data, params, headers):
+                  target = urlsplit(url)
+                  if target.hostname != self.PIKPAK_API_HOST:
+                      return await super()._send_request(method, url, data, params, headers)
+                  action = method.upper() + ":" + target.path
+                  if not self.captcha_token or time.monotonic() >= getattr(self, "_captcha_expiry", 0):
+                      await self._refresh_drive_captcha(action)
+                  response = await super()._send_request(method, url, data, params, self.get_headers())
+                  try:
+                      error = response.json()
+                  except ValueError:
+                      return response
+                  if isinstance(error, dict) and error.get("error") == "captcha_invalid":
+                      self.captcha_token = None
+                      await self._refresh_drive_captcha(action)
+                      response = await super()._send_request(method, url, data, params, self.get_headers())
+                  return response
+
+              async def _refresh_drive_captcha(self, action):
+                  result = await self.captcha_init(action)
+                  self.captcha_token = result.get("captcha_token")
+                  if not self.captcha_token:
+                      raise PikpakException("Drive captcha token unavailable; verification required")
+
+              async def login(self):
+                  result = await self.captcha_init("POST:/v1/auth/signin")
+                  self.captcha_token = result.get("captcha_token")
+                  if not self.captcha_token:
+                      raise PikpakException("captcha_token get failed")
+                  result = await self._request_post(
+                      "https://user.mypikpak.com/v1/auth/signin",
+                      data={
+                          "client_id": self.WEB_CLIENT_ID,
+                          "username": self.username,
+                          "password": self.password,
+                      },
+                  )
+                  self.access_token = result["access_token"]
+                  self.refresh_token = result["refresh_token"]
+                  self.user_id = result["sub"]
+                  self.captcha_token = None
+                  self.encode_token()
+
+              async def refresh_access_token(self):
+                  if not self.refresh_token:
+                      raise PikpakException("Authentication failed; no refresh token")
+                  result = await self._request_post(
+                      "https://user.mypikpak.com/v1/auth/token",
+                      data={
+                          "client_id": self.WEB_CLIENT_ID,
+                          "refresh_token": self.refresh_token,
+                          "grant_type": "refresh_token",
+                      },
+                  )
+                  self.access_token = result["access_token"]
+                  self.refresh_token = result["refresh_token"]
+                  self.user_id = result["sub"]
+                  self.encode_token()
+                  if self.token_refresh_callback:
+                      await self.token_refresh_callback(self, **self.token_refresh_callback_kwargs)
+
+          EMAIL = os.environ.get("PIKPAK_EMAIL", "").strip()
+          PASSWORD = os.environ.get("PIKPAK_PASSWORD", "")
+          PIKPAK_PAT = os.environ.get("PIKPAK_PAT", "").strip()
+          DO_DELETE = os.environ.get("DELETE_AFTER_COLLECT", "false").lower() == "true"
+          MAX_COMPONENT_BYTES = 200
+
+          def safe_name(name: str) -> str:
+              clean = re.sub(r'[\/\\:\*\?"<>\|]', '_', (name or "").strip()) or "file"
+              raw = clean.encode("utf-8")
+              if len(raw) <= MAX_COMPONENT_BYTES:
+                  return clean
+              base, ext = os.path.splitext(clean)
+              if len(ext.encode("utf-8")) > 30:
+                  base, ext = clean, ""
+              digest = hashlib.sha1(raw).hexdigest()[:8]
+              budget = MAX_COMPONENT_BYTES - len(ext.encode("utf-8")) - len(digest) - 1
+              base = base.encode("utf-8")[:budget].decode("utf-8", "ignore")
+              return f"{base}_{digest}{ext}"
+
+          async def collect_all():
+              client = PikPakWebClient(
+                  username=EMAIL or "__pikpak_pat__",
+                  password=PASSWORD or "__pikpak_pat__",
+                  request_max_retries=2,
+                  httpx_client_args={"timeout": 30},
+              )
+              if PIKPAK_PAT:
+                  client.access_token = PIKPAK_PAT
+              diagnostics = []
+
+              async def auth_diagnostic(response):
+                  path = response.request.url.path
+                  if not ("/auth/" in path or "/captcha/" in path):
+                      return
+                  try:
+                      await response.aread()
+                      payload = response.json()
+                  except Exception:
+                      payload = {}
+                  if not isinstance(payload, dict):
+                      payload = {}
+                  if response.status_code < 400 and not payload.get("error"):
+                      return
+                  fields = []
+                  for key in ("error", "error_code", "code"):
+                      value = payload.get(key)
+                      if isinstance(value, (str, int)) and not isinstance(value, bool):
+                          value = str(value)
+                          if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", value):
+                              if value not in (EMAIL, PASSWORD, PIKPAK_PAT):
+                                  fields.append(f"{key}={value}")
+                  endpoint = "signin" if path.endswith("/signin") else "authentication"
+                  diagnostics.append(
+                      f"{endpoint}: HTTP {response.status_code}; "
+                      + (", ".join(fields) or "no safe symbolic error code")
+                  )
+
+              client.httpx_client.event_hooks.setdefault("response", []).append(auth_diagnostic)
+              try:
+                  if PIKPAK_PAT:
+                      print("Using PikPak Personal Access Token.")
+                  else:
+                      await client.login()
+              except Exception as exc:
+                  await client.httpx_client.aclose()
+                  message = str(exc).lower()
+                  if "review" in message:
+                      category = "review / verification rejection"
+                  elif "captcha" in message:
+                      category = "captcha / verification required"
+                  elif "password" in message or "credential" in message:
+                      category = "credential-related rejection"
+                  elif "timeout" in message:
+                      category = "network timeout"
+                  else:
+                      category = "unclassified login failure"
+                  lines = [
+                      "PikPak authentication failed: " + category,
+                      *diagnostics,
+                      "No files were collected or deleted.",
+                      "Do not repeatedly retry a review/captcha rejection.",
+                  ]
+                  for line in lines:
+                      print(line, flush=True)
+                  summary = os.environ.get("GITHUB_STEP_SUMMARY")
+                  if summary:
+                      with open(summary, "a", encoding="utf-8") as f:
+                          f.write("## PikPak authentication diagnostics\n\n")
+                          f.write("\n".join("- " + line for line in lines) + "\n")
+                  raise SystemExit(1) from None
+
+              print("Authenticated - crawling file tree...")
+              print(f"Delete-after-collect {'ENABLED' if DO_DELETE else 'DISABLED'}\n")
+              entries = []
+
+              async def crawl(folder_id, folder_path):
+                  result = await client.file_list(parent_id=folder_id)
+                  items = result["files"]
+
+                  if not items:
+                      print(f"Empty folder: {folder_path or 'root'}")
+                      return
+
+                  for item in items:
+                      name, kind, item_id = item["name"], item["kind"], item["id"]
+                      if kind.endswith("folder"):
+                          new_path = os.path.join(folder_path, safe_name(name))
+                          print(f"Entering: {new_path}")
+                          await crawl(item_id, new_path)
+                          if DO_DELETE:
+                              try:
+                                  await client.delete_to_trash([item_id])
+                                  print(f"Trashed folder: {new_path}")
+                              except Exception as e:
+                                  print(f"Could not trash folder {new_path}: {e}")
+                      else:
+                          save_path = os.path.join(STORAGE_DIR, folder_path)
+                          try:
+                              res = await client.get_download_url(item_id)
+                              url = res["web_content_link"]
+                              masked = url.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                              print(f"::add-mask::{masked}", flush=True)
+                              fname = safe_name(name)
+                              entries.append({
+                                  "save_path": save_path, "name": fname, "url": url,
+                                  "pikpak_file_id": item_id, "source_size": item.get("size"),
+                              })
+                              print(f"[{len(entries):>3}] Collected: {os.path.join(folder_path, fname)}")
+                              if fname != name:
+                                  print(f"Adjusted from original name: {name}")
+                              if DO_DELETE:
+                                  try:
+                                      await client.delete_to_trash([item_id])
+                                      print(f"Trashed: {name}")
+                                  except Exception as e:
+                                      print(f"Could not trash {name}: {e}")
+                          except Exception as e:
+                              print(f"Could not get URL for {name} - {e}")
+
+              try:
+                  await crawl(None, "")
+                  with open(MANIFEST, "w", encoding="utf-8") as f:
+                      json.dump(entries, f, indent=2)
+                  print(f"\nManifest saved - {len(entries)} file(s) queued.")
+              finally:
+                  await client.httpx_client.aclose()
+
+          if __name__ == "__main__":
+              asyncio.run(collect_all())
+          EOF
+          python "$RUNNER_TEMP/collect_links.py"
+
+      # PHASE 1-B: Direct links - build manifest
+      - name: "[Direct] Parse direct download links"
+        if: ${{ github.event.inputs.source_type == 'direct_links' }}
+        env:
+          DIRECT_LINKS: ${{ github.event.inputs.direct_links }}
+        run: |
+          cat << 'EOF' > "$RUNNER_TEMP/parse_direct.py"
+          import os, json, hashlib, re
+          from urllib.parse import urlparse, unquote
+
+          RAW = os.environ.get("DIRECT_LINKS", "")
+          RUNNER_TEMP = os.environ.get("RUNNER_TEMP", ".")
+          SAVE_DIR = os.path.join(RUNNER_TEMP, "pikpak")
+          MANIFEST = os.path.join(RUNNER_TEMP, "meta", "manifest.json")
+          MAX_COMPONENT_BYTES = 200
+
+          def safe_name(name: str) -> str:
+              clean = re.sub(r'[\/\\:\*\?"<>\|]', '_', (name or "").strip()) or "file"
+              raw = clean.encode("utf-8")
+              if len(raw) <= MAX_COMPONENT_BYTES:
+                  return clean
+              base, ext = os.path.splitext(clean)
+              if len(ext.encode("utf-8")) > 30:
+                  base, ext = clean, ""
+              digest = hashlib.sha1(raw).hexdigest()[:8]
+              budget = MAX_COMPONENT_BYTES - len(ext.encode("utf-8")) - len(digest) - 1
+              base = base.encode("utf-8")[:budget].decode("utf-8", "ignore")
+              return f"{base}_{digest}{ext}"
+
+          entries = []
+          for raw_line in RAW.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+
+              parts = line.split(None, 1)
+              url = parts[0]
+              masked = url.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::add-mask::{masked}", flush=True)
+              if len(parts) == 2:
+                  custom = parts[1].strip().replace("\\", "/")
+                  name = safe_name(os.path.basename(custom))
+                  subdir = os.path.dirname(custom)
+                  save_path = (os.path.join(SAVE_DIR, *[safe_name(p) for p in subdir.split("/") if p])
+                               if subdir else SAVE_DIR)
+              else:
+                  parsed = urlparse(url)
+                  decoded_path = unquote(parsed.path)
+                  name = safe_name(os.path.basename(decoded_path) or f"file_{len(entries)+1}")
+                  save_path = SAVE_DIR
+
+              entries.append({"save_path": save_path, "name": name, "url": url})
+              display = os.path.relpath(os.path.join(save_path, name), SAVE_DIR)
+              print(f"[{len(entries):>3}] {display}")
+              print("Source URL hidden for privacy.")
+
+          with open(MANIFEST, "w", encoding="utf-8") as f:
+              json.dump(entries, f, indent=2)
+          print(f"\nManifest saved - {len(entries)} file(s) queued.")
+          EOF
+          python "$RUNNER_TEMP/parse_direct.py"
+
+      # PHASE 1-C: Show manifest
+      - name: Show manifest
+        run: |
+          cat << 'EOF' > "$RUNNER_TEMP/show_manifest.py"
+          import json, os
+          RUNNER_TEMP = os.environ.get("RUNNER_TEMP", ".")
+          manifest_path = os.path.join(RUNNER_TEMP, "meta", "manifest.json")
+          base_storage = os.path.join(RUNNER_TEMP, "pikpak")
+
+          with open(manifest_path, encoding="utf-8") as f:
+              entries = json.load(f)
+          print(f"{'#':>4}  {'HF path':<45}")
+          print("-" * 75)
+          for i, e in enumerate(entries, 1):
+              rel = os.path.relpath(os.path.join(e["save_path"], e["name"]), base_storage)
+              print(f"{i:>4}  {rel:<45}")
+          print(f"\nTotal: {len(entries)} file(s) queued.")
+          EOF
+          python "$RUNNER_TEMP/show_manifest.py"
+
+      # PHASE 2: Download all files
+      - name: Download files
+        id: download_files
+        env:
+          SOURCE_TYPE: ${{ github.event.inputs.source_type }}
+          DOWNLOADER:  ${{ github.event.inputs.downloader }}
+        run: |
+          cat << 'EOF' > "$RUNNER_TEMP/download_files.py"
+          import os, json, subprocess, shutil, sys, hashlib, re
+
+          RUNNER_TEMP = os.environ.get("RUNNER_TEMP", ".")
+          MANIFEST = os.path.join(RUNNER_TEMP, "meta", "manifest.json")
+          RECEIPTS = os.path.join(RUNNER_TEMP, "meta", "downloaded.json")
+          SOURCE_TYPE = os.environ.get("SOURCE_TYPE", "pikpak")
+          DL_CHOICE = os.environ.get("DOWNLOADER", "auto").lower()
+          MAX_COMPONENT_BYTES = 200
+          downloaded = []
+
+          def save_receipts():
+              with open(RECEIPTS + ".tmp", "w", encoding="utf-8") as f:
+                  json.dump(downloaded, f)
+              os.replace(RECEIPTS + ".tmp", RECEIPTS)
+
+          save_receipts()
+
+          def safe_name(name: str) -> str:
+              clean = re.sub(r'[\/\\:\*\?"<>\|]', '_', (name or "").strip()) or "file"
+              raw = clean.encode("utf-8")
+              if len(raw) <= MAX_COMPONENT_BYTES:
+                  return clean
+              base, ext = os.path.splitext(clean)
+              if len(ext.encode("utf-8")) > 30:
+                  base, ext = clean, ""
+              digest = hashlib.sha1(raw).hexdigest()[:8]
+              budget = MAX_COMPONENT_BYTES - len(ext.encode("utf-8")) - len(digest) - 1
+              base = base.encode("utf-8")[:budget].decode("utf-8", "ignore")
+              return f"{base}_{digest}{ext}"
+
+          if DL_CHOICE == "auto":
+              DL_CHOICE = "aria2c" if SOURCE_TYPE == "pikpak" else "wget"
+              print(f"Auto-selected downloader: {DL_CHOICE!r} (source: {SOURCE_TYPE})")
+
+          # Check binary exists in PATH (accounting for .exe on Windows)
+          resolved_bin = shutil.which(DL_CHOICE) or shutil.which(f"{DL_CHOICE}.exe")
+          if not resolved_bin:
+              print(f"Downloader '{DL_CHOICE}' not found in PATH.")
+              sys.exit(1)
+
+          print(f"Downloader: {resolved_bin}\n")
+
+          def cmd_aria2c(url, save_path, name):
+              return [
+                  resolved_bin,
+                  f"--dir={save_path}",
+                  f"--out={name}",
+                  "--max-connection-per-server=16",
+                  "--split=16",
+                  "--min-split-size=1M",
+                  "--file-allocation=none",
+                  "--auto-file-renaming=false",
+                  "--allow-overwrite=true",
+                  "--user-agent=Mozilla/5.0",
+                  "--header=Referer: https://mypikpak.com",
+                  "--console-log-level=notice",
+                  "--summary-interval=5",
+                  url,
+              ]
+
+          def cmd_wget(url, save_path, name):
+              return [
+                  resolved_bin,
+                  "--no-verbose",
+                  "--show-progress",
+                  "--progress=bar:force",
+                  "--user-agent=Mozilla/5.0",
+                  "-O", os.path.join(save_path, name),
+                  url,
+              ]
+
+          def cmd_curl(url, save_path, name):
+              return [
+                  resolved_bin, "--fail", "-L",
+                  "--progress-bar",
+                  "-A", "Mozilla/5.0",
+                  "-o", os.path.join(save_path, name),
+                  url,
+              ]
+
+          BUILDERS = {"aria2c": cmd_aria2c, "wget": cmd_wget, "curl": cmd_curl}
+          build_cmd = BUILDERS.get(DL_CHOICE)
+          if not build_cmd:
+              print(f"Unknown downloader: {DL_CHOICE!r}. Choose: aria2c, wget, curl")
+              sys.exit(1)
+
+          with open(MANIFEST, encoding="utf-8") as f:
+              entries = json.load(f)
+          total, success, failed = len(entries), 0, []
+
+          for idx, entry in enumerate(entries, 1):
+              save_path, name, url = entry["save_path"], entry["name"], entry["url"]
+              name = safe_name(name)
+              os.makedirs(save_path, exist_ok=True)
+              print(f"\n[{idx}/{total}] Downloading: {name}")
+              print("Source URL hidden for privacy.")
+              ret = subprocess.run(build_cmd(url, save_path, name)).returncode
+
+              if ret == 0:
+                  dest = os.path.join(save_path, name)
+                  size = os.path.getsize(dest) if os.path.exists(dest) else 0
+                  if not os.path.isfile(dest) or os.path.exists(dest + ".aria2"):
+                      print(f"Failed: {name} (completed output file not found)")
+                      failed.append(name)
+                      continue
+                  expected = entry.get("source_size")
+                  try:
+                      expected = int(expected) if expected is not None else None
+                  except (TypeError, ValueError):
+                      expected = None
+                  if expected is not None and expected >= 0 and size != expected:
+                      print(f"Failed: {name} (size mismatch: {size} != {expected} bytes)")
+                      failed.append(name)
+                      continue
+                  downloaded.append({
+                      "pikpak_file_id": entry.get("pikpak_file_id"),
+                      "path": dest, "size": size,
+                  })
+                  save_receipts()
+                  print(f"Done: {name} ({size / 1024 / 1024:.2f} MB)")
+                  success += 1
+              else:
+                  print(f"Failed: {name} (exit {ret})")
+                  failed.append(name)
+
+          print(f"\n{'='*55}")
+          print(f"Downloader : {DL_CHOICE}")
+          print(f"Success    : {success}/{total}")
+          if failed:
+              print(f"Failed     : {len(failed)}")
+              for name in failed:
+                  print(f"  - {name}")
+              sys.exit(1)
+          EOF
+          python "$RUNNER_TEMP/download_files.py"
+
+      # Trash successfully downloaded files (PAT only)
+      - name: "[PikPak PAT] Trash successfully downloaded files"
+        if: ${{ !cancelled() && github.event.inputs.source_type == 'pikpak' && github.event.inputs.delete_after_download == 'true' && (steps.download_files.outcome == 'success' || steps.download_files.outcome == 'failure') }}
+        env:
+          PIKPAK_PAT: ${{ github.event.inputs.pikpak_pat }}
+        run: |
+          cat << 'EOF' > "$RUNNER_TEMP/delete_downloaded.py"
+          import asyncio, json, os, sys
+          from collections import Counter
+
+          # Add runner temp to sys.path to import PikPakWebClient
+          RUNNER_TEMP = os.environ.get("RUNNER_TEMP", ".")
+          sys.path.insert(0, RUNNER_TEMP)
+          from collect_links import PikPakWebClient
+
+          async def main():
+              pat = os.environ.get("PIKPAK_PAT", "").strip()
+              if not pat:
+                  print("Deletion refused: PAT is required.")
+                  return 1
+              receipts_path = os.path.join(RUNNER_TEMP, "meta", "downloaded.json")
+              manifest_path = os.path.join(RUNNER_TEMP, "meta", "manifest.json")
+              if not os.path.isfile(receipts_path):
+                  print("No successful-download receipts; nothing will be deleted.")
+                  return 0
+              with open(receipts_path, encoding="utf-8") as f:
+                  receipts = json.load(f)
+              with open(manifest_path, encoding="utf-8") as f:
+                  manifest = json.load(f)
+              paths = Counter(os.path.join(e["save_path"], e["name"]) for e in manifest)
+              client = PikPakWebClient(
+                  username="__pikpak_pat__", password="__pikpak_pat__",
+                  request_max_retries=2, httpx_client_args={"timeout": 30},
+              )
+              client.access_token = pat
+
+              async def no_refresh():
+                  raise RuntimeError("PAT rejected or expired; supply a valid PAT")
+              client.refresh_access_token = no_refresh
+              trashed, skipped, failed = 0, 0, 0
+              seen = set()
+              storage_root = os.path.join(RUNNER_TEMP, "pikpak")
+
+              try:
+                  for receipt in receipts:
+                      file_id, path = receipt.get("pikpak_file_id"), receipt["path"]
+                      name = os.path.relpath(path, storage_root)
+                      if not file_id or file_id in seen:
+                          skipped += 1
+                          continue
+                      if (paths[path] != 1 or not os.path.isfile(path)
+                              or os.path.exists(path + ".aria2")
+                              or os.path.getsize(path) != receipt["size"]):
+                          print(f"Kept in PikPak: {name} (missing, changed, or ambiguous local output)")
+                          skipped += 1
+                          continue
+                      seen.add(file_id)
+                      try:
+                          await client.delete_to_trash([file_id])
+                          trashed += 1
+                          print(f"Moved to PikPak trash: {name}")
+                      except Exception as exc:
+                          failed += 1
+                          message = str(exc).lower()
+                          reason = ("PAT rejected/expired or missing delete permission"
+                                    if any(s in message for s in ("401", "403", "unauthor", "forbidden", "pat rejected", "scope", "permission"))
+                                    else "verification required" if any(s in message for s in ("captcha", "review"))
+                                    else "network timeout" if "timeout" in message
+                                    else "API request failed")
+                          print(f"Could not trash: {name} ({reason}); local download retained.")
+                  summary = f"PikPak deletion: {trashed} trashed, {skipped} skipped, {failed} failed."
+                  print(summary)
+                  print("Folders are retained. Deletion happens before HuggingFace upload.")
+                  if os.environ.get("GITHUB_STEP_SUMMARY"):
+                      with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+                          f.write("\n## PAT delete-after-download\n\n" + summary + "\n")
+                          f.write("Folders retained; failed downloads not deleted. Deletion precedes HF upload.\n")
+              finally:
+                  await client.httpx_client.aclose()
+
+              with open(os.path.join(RUNNER_TEMP, "meta", "deletion_failed"), "w", encoding="utf-8") as f:
+                  f.write(str(failed))
+              return 0
+
+          if __name__ == "__main__":
+              sys.exit(asyncio.run(main()))
+          EOF
+          python "$RUNNER_TEMP/delete_downloaded.py"
+
+      - name: List downloaded files
+        run: |
+          cat << 'EOF' > "$RUNNER_TEMP/list_files.py"
+          import os
+          storage = os.path.join(os.environ.get("RUNNER_TEMP", "."), "pikpak")
+          for root, dirs, files in os.walk(storage):
+              for file in files:
+                  full_path = os.path.join(root, file)
+                  size_mb = os.path.getsize(full_path) / (1024 * 1024)
+                  rel = os.path.relpath(full_path, storage)
+                  print(f"{size_mb:>8.2f} MB  {rel}")
+          EOF
+          python "$RUNNER_TEMP/list_files.py"
+
+      # PHASE 3: Upload to HuggingFace
+      - name: Upload to HuggingFace
+        env:
+          HF_TOKEN:  ${{ github.event.inputs.hf_token }}
+          REPO_ID:   ${{ github.event.inputs.repo_id }}
+          REPO_TYPE: ${{ github.event.inputs.repo_type }}
+        run: |
+          cat << 'EOF' > "$RUNNER_TEMP/hf_upload.py"
+          import os
+          from huggingface_hub import HfApi
+
+          TOKEN = os.environ["HF_TOKEN"]
+          REPO_ID = os.environ["REPO_ID"]
+          REPO_TYPE = os.environ["REPO_TYPE"]
+          RUNNER_TEMP = os.environ.get("RUNNER_TEMP", ".")
+          STORAGE_DIR = os.path.join(RUNNER_TEMP, "pikpak")
+          api = HfApi()
+
+          try:
+              api.create_repo(repo_id=REPO_ID, repo_type=REPO_TYPE, token=TOKEN, exist_ok=True)
+              print(f"Repo ready: {REPO_ID}")
+          except Exception as e:
+              print(f"Repo check: {e}")
+
+          print(f"Uploading to https://huggingface.co/{REPO_ID}")
+          api.upload_folder(
+              folder_path=STORAGE_DIR,
+              repo_id=REPO_ID,
+              repo_type=REPO_TYPE,
+              token=TOKEN,
+          )
+          print("Upload complete!")
+          EOF
+          python "$RUNNER_TEMP/hf_upload.py"
+
+      - name: Report PAT deletion failures
+        if: ${{ !cancelled() && github.event.inputs.source_type == 'pikpak' && github.event.inputs.delete_after_download == 'true' }}
+        run: |
+          STATUS_FILE="$RUNNER_TEMP/meta/deletion_failed"
+          if [ -f "$STATUS_FILE" ] && [ "$(< "$STATUS_FILE")" != "0" ]; then
+            echo "::error::Some PikPak files could not be moved to trash. See the PAT deletion step."
+            exit 1
+          fi
